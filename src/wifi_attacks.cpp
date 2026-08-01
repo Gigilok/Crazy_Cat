@@ -448,23 +448,11 @@ RemoteDevice* getRemoteDevice(uint8_t index) {
 // CAMERA FREEZE — jammer 2.4GHz via NRF24 para bloquear camêras IP WiFi
 extern void nrf24StartJammer();
 extern void nrf24StopJammer();
-extern bool nrf24IsAvailable();
-extern bool nrf24IsJammerActive();
 
 void startCameraFreeze() {
     if (cameraFreezeActive) return;
-    // CORREÇÃO: verifica se o NRF24 está conectado antes de iniciar
-    if (!nrf24IsAvailable()) {
-        Serial.println(F("[Camera] FAIL: NRF24 nao disponivel"));
-        return;
-    }
     cameraFreezeActive = true;
     nrf24StartJammer();
-    // Se nrf24StartJammer falhou (radio not connected), reverte flag
-    if (!nrf24IsJammerActive()) {
-        cameraFreezeActive = false;
-        Serial.println(F("[Camera] JAMMER nao iniciado"));
-    }
 }
 void stopCameraFreeze() {
     if (!cameraFreezeActive) return;
@@ -479,40 +467,28 @@ extern void cc1101WriteReg(uint8_t, uint8_t);
 extern void cc1101SendCommand(uint8_t);
 extern void cc1101StopSubGHzJammer();
 
-// Constantes CC1101 (espelham cc1101.cpp)
-#define CC_SCAL  0x33
-#define CC_SIDLE 0x36
-#define CC_STX   0x35
-#define CC_IOCFG0 0x02
-
 void startDroneJammer() {
     if (droneJammerActive) return;
     if (!cc1101Initialized) return;
     droneJammerActive = true;
     cc1101StopSubGHzJammer();
     delay(10);
-    // CORREÇÃO: SCAL obriga recalibração do VCO após mudar de freq
-    // Sem isso o sintetizador pode transmitir em frequência errada
     cc1101SetFrequency(915000000);
-    cc1101SendCommand(CC_SCAL);  // recalibra VCO
+    cc1101WriteReg(0x02, 0x2E);
+    cc1101SendCommand(0x36);
     delay(2);
-    cc1101WriteReg(CC_IOCFG0, 0x2E);  // TX Asynchronous Serial Output
-    cc1101SendCommand(CC_SIDLE);
-    delay(2);
-    cc1101SendCommand(CC_STX);
+    cc1101SendCommand(0x35);
     delay(2);
     pinMode(CC1101_GDO0, OUTPUT);
     digitalWrite(CC1101_GDO0, HIGH);
-    Serial.println(F("[Drone] JAMMER ativo em 915MHz"));
 }
 void stopDroneJammer() {
     if (!droneJammerActive) return;
     droneJammerActive = false;
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT);
-    cc1101WriteReg(CC_IOCFG0, 0x0D);
-    cc1101SendCommand(CC_SIDLE);
-    Serial.println(F("[Drone] JAMMER parado"));
+    cc1101WriteReg(0x02, 0x0D);
+    cc1101SendCommand(0x36);
 }
 
 struct DroneLocation {
