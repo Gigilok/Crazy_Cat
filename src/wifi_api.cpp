@@ -100,7 +100,7 @@ extern void stopCameraFreeze();
 extern void initConnection(int);
 extern void setBrightness(uint8_t brightness);
 
-extern String getPcapData();
+extern uint8_t* getPcapData(size_t* outLen);
 
 // ============================================================
 // SERVER
@@ -179,8 +179,8 @@ static void handleNetworks() {
         JsonObject obj = nets.createNestedObject();
         obj["id"] = i;
         obj["ssid"] = net->ssid;
-        obj["channel"] = net->channel;
-        obj["rssi"] = net->rssi;
+        obj["channel"] = (int)net->channel;
+        obj["rssi"] = (int)net->rssi;
         obj["encrypted"] = net->encrypted;
         char bssid[18];
         snprintf(bssid, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -200,15 +200,15 @@ static void handleScanNetworks() {
     DynamicJsonDocument doc(2048);
     doc["status"] = "ok";
     doc["message"] = "Scan complete";
-    doc["count"] = networkCount;
+    doc["count"] = (int)networkCount;
     JsonArray nets = doc.createNestedArray("networks");
     for (int i = 0; i < (int)networkCount; i++) {
         NetworkInfo* net = &scannedNetworks[i];
         JsonObject obj = nets.createNestedObject();
         obj["id"] = i;
         obj["ssid"] = net->ssid;
-        obj["channel"] = net->channel;
-        obj["rssi"] = net->rssi;
+        obj["channel"] = (int)net->channel;
+        obj["rssi"] = (int)net->rssi;
         obj["encrypted"] = net->encrypted;
         char bssid[18];
         snprintf(bssid, 18, "%02X:%02X:%02X:%02X:%02X:%02x",
@@ -265,14 +265,18 @@ static void handleHandshakeDownload() {
         sendERR("No handshake captured. Use Evil Twin first");
         return;
     }
-    String pcapData = getPcapData();
-    if (pcapData.length() == 0) {
+    size_t pcapLen = 0;
+    uint8_t* pcapData = getPcapData(&pcapLen);
+    if (pcapData == nullptr || pcapLen == 0) {
         sendERR("Failed to build PCAP file.");
         return;
     }
     apiServer.sendHeader("Content-Disposition", "attachment; filename=handshake.pcap");
+    apiServer.sendHeader("Content-Length", String(pcapLen));
     apiServer.sendHeader("Connection", "close");
-    apiServer.send(200, "application/vnd.tcpdump.pcap", pcapData);
+    apiServer.send(200, "application/vnd.tcpdump.pcap", "");
+    apiServer.sendContent((const char*)pcapData, pcapLen);
+    free(pcapData);
 }
 
 static void handleNRF24JammerStart() { if (!nrf24JammerActive) nrf24StartJammer(); sendOK("NRF24 Jammer started"); }
@@ -284,8 +288,8 @@ static void handleNRF24ScanData() {
     DynamicJsonDocument doc(512);
     const int8_t* bars = nrf24GetScanBarData();
     JsonArray arr = doc.createNestedArray("bars");
-    for (int i = 0; i < 16; i++) arr.add(bars[i]);
-    doc["packets"] = nrf24GetScanTotalPackets();
+    for (int i = 0; i < 16; i++) arr.add((int)bars[i]);
+    doc["packets"] = (uint32_t)nrf24GetScanTotalPackets();
     String out;
     serializeJson(doc, out);
     sendJSON(200, out);
@@ -359,11 +363,11 @@ static void handleCC1101GetRaw() {
     if (!sig || !sig->valid) { sendERR("Invalid signal id"); return; }
     
     DynamicJsonDocument doc(4096);
-    doc["frequency"] = sig->frequency;
-    doc["length"] = sig->length;
+    doc["frequency"] = (uint32_t)sig->frequency;
+    doc["length"] = (int)sig->length;
     JsonArray timings = doc.createNestedArray("timings");
     for (int i = 0; i < sig->length; i++) {
-        timings.add(sig->timings[i]);
+        timings.add((int)sig->timings[i]);
     }
     String out;
     serializeJson(doc, out);
@@ -379,15 +383,18 @@ static void handleCC1101TransmitRaw() {
     uint32_t freq = doc["frequency"];
     JsonArray timings = doc["timings"];
     
-    uint8_t length = timings.size();
+    size_t length = timings.size();
     if (length == 0 || length > 200) { sendERR("Invalid timings length"); return; }
     
     uint16_t buf[200];
-    for (int i = 0; i < length; i++) {
-        buf[i] = timings[i];
+    for (size_t i = 0; i < length; i++) {
+        int v = timings[i];
+        if (v < 0) v = 0;
+        if (v > 65535) v = 65535;
+        buf[i] = (uint16_t)v;
     }
     
-    cc1101TransmitRaw(freq, buf, length);
+    cc1101TransmitRaw(freq, buf, (uint8_t)length);
     sendOK("Raw signal transmitted");
 }
 
@@ -431,7 +438,7 @@ static void handleBTDevices() {
         BTDevice* dev = getBTDevice(i);
         if (!dev) continue;
         JsonObject obj = arr.createNestedObject();
-        obj["id"] = i; obj["name"] = dev->name; obj["rssi"] = dev->rssi;
+        obj["id"] = i; obj["name"] = dev->name; obj["rssi"] = (int)dev->rssi;
     }
     String out; serializeJson(doc, out); sendJSON(200, out);
 }
@@ -632,9 +639,20 @@ extern void cc1101RollJamLoop();
 extern bool cc1101RollJamActive;
 extern void cc1101AnalyzerLoop();
 extern bool cc1101AnalyzerIsRunning();
+// CORREÇÃO: forward declarations que faltavam para os loops via API
+extern int  nrf24JammerLoop();
+extern bool nrf24JammerActive;
+extern void bfLoop();
+extern bool bfRunning;
+// Portal loop - processa requisições do captive portal (porta 80)
+extern void portalLoop();
+extern bool isPortalActive();
 
 void apiLoop() {
     if (apiRunning) apiServer.handleClient();
+
+    // Processa captive portal (Evil Twin) - server(80) do wifi_portal.cpp
+    if (isPortalActive()) portalLoop();
 
     if (pendingDeauthStart) {
         pendingDeauthStart = false;
@@ -653,10 +671,15 @@ void apiLoop() {
         stopEvilTwin();
     }
 
-    // TOOL LOOPS: apenas CC1101 (NRF24 já é gerido pelo menu.cpp)
+    // TOOL LOOPS: CC1101 + NRF24 + BruteForce
+    // CORREÇÃO: nrf24JammerLoop() e bfLoop() ANTES não eram chamados via API,
+    // então o jammer de câmera (Camera Freeze) e o bruteforce não funcionavam
+    // quando ativados pelo APK - ficavam presos no estado inicial.
     if (cc1101CopyActive)              cc1101CaptureLoop();
     if (cc1101RollJamActive)           cc1101RollJamLoop();
     if (cc1101AnalyzerIsRunning())     cc1101AnalyzerLoop();
+    if (nrf24JammerActive)             nrf24JammerLoop();
+    if (bfRunning)                     bfLoop();
 }
 
 bool isAPIServerRunning() { return apiRunning; }
