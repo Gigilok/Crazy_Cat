@@ -632,11 +632,6 @@ extern void cc1101RollJamLoop();
 extern bool cc1101RollJamActive;
 extern void cc1101AnalyzerLoop();
 extern bool cc1101AnalyzerIsRunning();
-// CORREÇÃO: forward declarations que faltavam para os loops via API
-extern int  nrf24JammerLoop();
-extern bool nrf24JammerActive;
-extern void bfLoop();
-extern bool bfRunning;
 
 void apiLoop() {
     if (apiRunning) apiServer.handleClient();
@@ -658,15 +653,10 @@ void apiLoop() {
         stopEvilTwin();
     }
 
-    // TOOL LOOPS: CC1101 + NRF24 + BruteForce
-    // CORREÇÃO: nrf24JammerLoop() e bfLoop() ANTES não eram chamados via API,
-    // então o jammer de câmera (Camera Freeze) e o bruteforce não funcionavam
-    // quando ativados pelo APK - ficavam presos no estado inicial.
+    // TOOL LOOPS: apenas CC1101 (NRF24 já é gerido pelo menu.cpp)
     if (cc1101CopyActive)              cc1101CaptureLoop();
     if (cc1101RollJamActive)           cc1101RollJamLoop();
     if (cc1101AnalyzerIsRunning())     cc1101AnalyzerLoop();
-    if (nrf24JammerActive)             nrf24JammerLoop();
-    if (bfRunning)                     bfLoop();
 }
 
 bool isAPIServerRunning() { return apiRunning; }
