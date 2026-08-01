@@ -358,6 +358,13 @@ void nrf24SpecSetAnalysisChannel(int8_t ch) { (void)ch; }
 #define JAM_SWITCH_INTERVAL_US 200
 void nrf24StartJammer() {
     if (nrf24JammerActive) return;
+    // CORREÇÃO: verifica se o rádio NRF24 está conectado antes de tudo
+    // Sem isso, radio.startConstCarrier() pode causar crash se o módulo
+    // não responde (NRF24 desconectado ou pino solto)
+    if (!radio.isChipConnected()) {
+        Serial.println(F("[NRF24] JAMMER: modulo nao conectado!"));
+        return;
+    }
     nrf24JammerActive = true;
     jamTotalPackets = 0;
     jamChannelPackets = 0;
@@ -368,10 +375,13 @@ void nrf24StartJammer() {
     radio.setAutoAck(false);
     radio.setRetries(0, 0);
     radio.setPALevel(RF24_PA_MAX, true);
-    radio.setDataRate(RF24_2MBPS);
+    // CORREÇÃO: 1MBPS é mais efetivo para jammer de WiFi porque
+    // ocupa mais largura de banda por canal (vs 2MBPS que é mais narrow)
+    radio.setDataRate(RF24_1MBPS);
     radio.setCRCLength(RF24_CRC_DISABLED);
     radio.setChannel(0);
     radio.startConstCarrier(RF24_PA_MAX, 0);
+    Serial.println(F("[NRF24] JAMMER: iniciado (1MBPS, channel hopping 0-125)"));
 }
 void nrf24StopJammer() {
     if (!nrf24JammerActive) return;
