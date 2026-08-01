@@ -62,7 +62,10 @@ void btScanTask(void *pvParameters) {
     btScanActive = true;
     Serial.println("[BT] >>> SCAN START <<<");
 
-    BLEDevice::getAdvertising()->stop();
+    // Sรณ chama getAdvertising()->stop() se BLE foi inicializado
+    if (bleInitialized) {
+        BLEDevice::getAdvertising()->stop();
+    }
     vTaskDelay(300 / portTICK_PERIOD_MS);
 
     if (!pBLEScan) pBLEScan = BLEDevice::getScan();
@@ -70,6 +73,9 @@ void btScanTask(void *pvParameters) {
     vTaskDelay(100 / portTICK_PERIOD_MS);
     pBLEScan->clearResults();
     
+    if (pScanCallbacks == nullptr) {
+        pScanCallbacks = new MyAdvertisedDeviceCallbacks();
+    }
     pBLEScan->setAdvertisedDeviceCallbacks(pScanCallbacks, true);
     pBLEScan->setActiveScan(true);
     pBLEScan->setInterval(0x50);  
@@ -203,6 +209,13 @@ static void buildXiaomiPkt(uint8_t* buf, uint8_t& len) {
 // ============================================================
 void btJammerTask(void *pvParameters) {
     Serial.println("[BT] Spam started (Audited Payloads)");
+    if (pServer == nullptr) {
+        Serial.println("[BT] FATAL: pServer null, aborting jammer");
+        btJammerActive = false;
+        btJammerTaskHandle = nullptr;
+        vTaskDelete(NULL);
+        return;
+    }
     BLEAdvertising* pAdv = pServer->getAdvertising();
     
     uint8_t st=0; uint32_t cnt=0;
@@ -214,7 +227,7 @@ void btJammerTask(void *pvParameters) {
     pAdv->setAdvertisementType(ADV_TYPE_NONCONN_IND);
     
     while (btJammerActive) {
-        // 1. Gera MAC Aleatório (Static Random)
+        // 1. Gera MAC Aleatรณrio (Static Random)
         esp_bd_addr_t dummy_addr;
         for (int i = 0; i < 6; i++) dummy_addr[i] = random(256);
         dummy_addr[0] |= 0xC0; // Bits superiores como 11 (Static Random)
@@ -236,7 +249,7 @@ void btJammerTask(void *pvParameters) {
             buildXiaomiPkt(pkt_buf, pkt_len);
         }
 
-        // 3. Injeta os bytes direto no rádio
+        // 3. Injeta os bytes direto no rรกdio
         BLEAdvertisementData oAdvertisementData;
         oAdvertisementData.addData(std::string((char*)pkt_buf, pkt_len));
         pAdv->setAdvertisementData(oAdvertisementData);
@@ -244,14 +257,14 @@ void btJammerTask(void *pvParameters) {
         // 4. Dispara o pacote
         pAdv->start();
         
-        // 40ms: Garante que o rádio transmita o pacote nos 3 canais (37, 38, 39)
-        // Com intervalo de 20ms, o pacote é transmitido 2 vezes por canal.
+        // 40ms: Garante que o rรกdio transmita o pacote nos 3 canais (37, 38, 39)
+        // Com intervalo de 20ms, o pacote รฉ transmitido 2 vezes por canal.
         vTaskDelay(40 / portTICK_PERIOD_MS); 
         
         pAdv->stop();
         
         // 5ms: Yield para o processador limpar a fila de eventos do BLE
-        // Sem isso, o stack do Bluedroid enche e começa a descartar pacotes.
+        // Sem isso, o stack do Bluedroid enche e comeรงa a descartar pacotes.
         vTaskDelay(5 / portTICK_PERIOD_MS);
 
         cnt++;
@@ -311,6 +324,10 @@ void startBTScan() {
 void stopBTScan() {
     if (pBLEScan && btScanActive) pBLEScan->stop();
     btScanActive = false;
+    if (btScanTaskHandle) {
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+        btScanTaskHandle = nullptr;
+    }
 }
 
 bool isBTScanning() { return btScanActive; }
