@@ -154,7 +154,6 @@ bool cc1101Init() {
 
     cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
     cc1101WriteReg(CC1101_FIFOTHR, 0x47);
-    // CORREÇÃO: whitening OFF (0x30) - 0x32 corrompe captura OOK
     cc1101WriteReg(CC1101_PKTCTRL0, 0x30); 
     cc1101WriteReg(CC1101_MDMCFG4, 0xF7); 
     cc1101WriteReg(CC1101_MDMCFG3, 0x83); 
@@ -165,8 +164,6 @@ bool cc1101Init() {
     cc1101WriteReg(CC1101_MCSM0, 0x18);
     cc1101WriteReg(CC1101_FOCCFG, 0x16);
     cc1101WriteReg(CC1101_BSCFG, 0x6C);
-    // AGC adaptativo padrão (igual Flipper Zero e rc-switch)
-    // NÃO usar 0x07 (ganho máximo) - capta ruído como sinal
     cc1101WriteReg(CC1101_AGCCTRL2, 0x43);
     cc1101WriteReg(CC1101_AGCCTRL1, 0x40);
     cc1101WriteReg(CC1101_AGCCTRL0, 0x91);
@@ -201,13 +198,11 @@ void cc1101StartCapture() {
     capture_state = STATE_HOPPING;
     isr_enabled = false;
     isr_count = 0;
-    // 0x0D = async serial data output (copia sinal ASK/OOK direto pro GDO0)
+    // CORREÇÃO: 0x0D = async serial data output (copia sinal ASK/OOK direto)
+    // ANTES usava 0x06 (RX FIFO fill) que nunca sinaliza para sinais OOK de controles
     cc1101WriteReg(CC1101_IOCFG0, 0x0D);
     pinMode(CC1101_GDO0, INPUT); 
     cc1101SetFrequency(currentCapture.frequency);
-    // CORREÇÃO: SCAL recalibra VCO para a frequência inicial
-    // Sem isso o VCO pode estar calibrado para freq errada e não detectar sinal
-    cc1101SendCommand(CC1101_SCAL); delay(1);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX); delay(10);
 }
@@ -218,47 +213,20 @@ void cc1101CaptureLoop() {
     unsigned long nowMs = millis();
 
     if (capture_state == STATE_HOPPING) {
-        // CORREÇÃO CRÍTICA: usa RSSI para detectar sinal em vez de digitalRead(GDO0).
-        // 
-        // O problema do digitalRead(GDO0):
-        // - GDO0 com IOCFG0=0x0D em modo OOK sai o DADO DEMODULADO
-        // - Ou seja: oscila HIGH/LOW rapidamente seguindo os bits do sinal
-        // - Polling tem ~50% de chance de pegar HIGH em qualquer momento
-        // - Se o loop demorar >1ms, pode perder completamente o pulso HIGH
-        //
-        // RSSI é uma medida analógica que não oscila:
-        // - Sem sinal: RSSI ≈ -100dBm (ruído de fundo)
-        // - Com sinal: RSSI > -75dBm (carrier detectado)
-        // - Funciona independente do padrão de dados
-        uint8_t rssiDec = cc1101ReadStatus(CC1101_RSSI);
-        int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
-        
-        // Log de debug a cada 500ms para ver o que está acontecendo
-        static unsigned long lastDebugPrint = 0;
-        if (nowMs - lastDebugPrint > 500) {
-            lastDebugPrint = nowMs;
-            Serial.printf("[CC1101] HOPPING freq=%lu MHz RSSI=%d dBm GDO0=%d\n",
-                          currentCapture.frequency / 1000000, rssi, digitalRead(CC1101_GDO0));
-        }
-        
-        if (rssi > -75) {
-            // Sinal detectado! Trava nesta frequência
+        if (digitalRead(CC1101_GDO0) == HIGH) {
             capture_state = STATE_LOCKED;
-            Serial.printf("[CC1101] SINAL DETECTADO! freq=%lu MHz RSSI=%d dBm\n",
-                          currentCapture.frequency / 1000000, rssi);
         } 
-        else if (nowMs - lastFreqSwitch > 1000) {
-            // Sem sinal, troca de frequência
+        else if (nowMs - lastFreqSwitch > 400) {
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             cc1101SetFrequency(currentCapture.frequency);
-            cc1101SendCommand(CC1101_SCAL); delay(1);
             cc1101SendCommand(CC1101_SIDLE); delay(1);
             cc1101SendCommand(CC1101_SRX); delay(5);
             lastFreqSwitch = nowMs;
         }
     } 
     else if (capture_state == STATE_LOCKED) {
+        // IOCFG0 já está em 0x0D desde StartCapture (não precisa reescrever)
         delay(2); 
         isr_count = 0;
         isr_last_val = digitalRead(CC1101_GDO0);
@@ -266,7 +234,6 @@ void cc1101CaptureLoop() {
         capture_started = false;
         isr_enabled = true; 
         capture_state = STATE_CAPTURING;
-        Serial.println("[CC1101] Iniciando captura de timings...");
     } 
     else if (capture_state == STATE_CAPTURING) {
         bool silenceTimeout = (capture_started && (now - isr_last_change > 50000));
@@ -274,32 +241,19 @@ void cc1101CaptureLoop() {
         bool totalTimeout = (nowMs - currentCapture.startTime > CAPTURE_DURATION);
         bool bufferFull = (isr_count >= 200);
 
-        // Debug: mostra progresso da captura a cada 200ms
-        static unsigned long lastCapDebug = 0;
-        if (nowMs - lastCapDebug > 200) {
-            lastCapDebug = nowMs;
-            if (isr_count > 0) {
-                Serial.printf("[CC1101] CAPTURANDO: %d timings, GDO0=%d\n", isr_count, digitalRead(CC1101_GDO0));
-            }
-        }
-
         if (noiseTimeout) {
             isr_enabled = false; 
-            Serial.printf("[CC1101] Noise timeout (count=%d). Voltando para hopping.\n", isr_count);
+            // Mantém 0x0D (não volta para 0x06 que não detecta OOK)
             isr_count = 0;
             capture_started = false;
             capture_state = STATE_HOPPING;
             isr_last_change = micros();
-            lastFreqSwitch = nowMs;
         }
         else if ((capture_started && silenceTimeout) || bufferFull) {
             isr_enabled = false; 
             currentCapture.active = false;
             cc1101CopyActive = false;
             cc1101SendCommand(CC1101_SIDLE);
-
-            Serial.printf("[CC1101] Captura finalizada: %d timings em %lu MHz\n",
-                          isr_count, currentCapture.frequency / 1000000);
 
             if (isr_count > 20 && savedSignalCount < MAX_SAVED_SIGNALS) {
                 SignalData* sig = &savedSignals[savedSignalCount];
@@ -312,21 +266,16 @@ void cc1101CaptureLoop() {
                     sig->timings[i] = isr_timings[i];
                     totalDuration += sig->timings[i];
                 }
-                Serial.printf("[CC1101] Sinal salvo! %d timings, duração total=%lu us\n",
-                              isr_count, totalDuration);
                 if (sig->length < 25 && totalDuration < 30000) snprintf(sig->name, 16, "Sensor %luM", sig->frequency / 1000000);
                 else if (sig->length >= 24 && sig->length <= 50) snprintf(sig->name, 16, "Portao %luM", sig->frequency / 1000000);
                 else if (sig->length > 50 || totalDuration > 70000) snprintf(sig->name, 16, "Carro %luM", sig->frequency / 1000000);
                 else snprintf(sig->name, 16, "Sinal %luM", sig->frequency / 1000000);
                 savedSignalCount++;
-            } else {
-                Serial.printf("[CC1101] Sinal NAO salvo: count=%d (min=20), savedCount=%d/%d\n",
-                              isr_count, savedSignalCount, MAX_SAVED_SIGNALS);
             }
         } 
         else if (totalTimeout) {
             isr_enabled = false;
-            Serial.println("[CC1101] Timeout total. Reiniciando captura.");
+            // Mantém 0x0D
             currentCapture.count = 0;
             currentCapture.startTime = millis();
             captureStartTime = millis(); 
@@ -337,7 +286,6 @@ void cc1101CaptureLoop() {
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             lastFreqSwitch = millis();
             cc1101SetFrequency(currentCapture.frequency);
-            cc1101SendCommand(CC1101_SCAL); delay(1);
             cc1101SendCommand(CC1101_SIDLE); delay(1);
             cc1101SendCommand(CC1101_SRX); delay(5);
         }
@@ -534,27 +482,17 @@ void cc1101AnalyzerLoop() {
 
     uint32_t freq = spec_an_freqs[spec_an_idx];
     cc1101SetFrequency(freq);
-    // SCAL recalibra VCO para cada frequência
-    cc1101SendCommand(CC1101_SCAL); delay(1);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX);
-    // CORREÇÃO: 1ms de settle time (era 500μs) - AGC precisa de tempo
-    // para estabilizar e ler RSSI real, não ruído de transição
-    delay(1);
+    delayMicroseconds(300); 
 
     uint8_t rssiDec = cc1101ReadStatus(CC1101_RSSI);
-    // Fórmula RSSI do datasheet do CC1101
     int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
     
-    // CORREÇÃO: só mostra sinal se RSSI > -80dBm (era -90)
-    // Ruído de fundo costuma estar entre -100 e -85dBm
-    // Sinais reais de controles ficam entre -70 e -30dBm
     if (rssi < -90) rssi = -90;
-    if (rssi > -30) rssi = -30;
+    if (rssi > -50) rssi = -50;
     
-    uint16_t target_h = map(rssi, -90, -30, 0, 40);
-    // CORREÇÃO: threshold mínimo para mostrar barra (evita ruído fantasma)
-    if (rssi < -80) target_h = 0;
+    uint16_t target_h = map(rssi, -90, -50, 0, 40);
     if (target_h > spec_an_values[spec_an_idx]) {
         spec_an_values[spec_an_idx] = target_h;
     }
