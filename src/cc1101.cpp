@@ -53,9 +53,6 @@ unsigned long rj_timer = 0;
 
 extern unsigned long captureStartTime; 
 
-// CORREÇÃO: frequências em ordem de probabilidade no Brasil
-// 433.92MHz é a mais comum (portões, controles de carro)
-// Deve ficar mais tempo nesta frequência antes de pular para outras
 uint32_t captureFreqs[] = {433920000, 315000000, 868000000, 915000000};
 uint8_t currentFreqIndex = 0;
 unsigned long lastFreqSwitch = 0;
@@ -157,9 +154,8 @@ bool cc1101Init() {
 
     cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
     cc1101WriteReg(CC1101_FIFOTHR, 0x47);
-    // CORREÇÃO: 0x30 = whitening OFF, serial mode, no CRC
-    // ANTES era 0x32 (whitening ON) que XOR o sinal com pseudo-aleatório
-    // e corrompia a captura RAW de sinais OOK de controles
+    // Whitening OFF: 0x32 tem whitening ON que corrompe captura RAW de OOK
+    // 0x30 = serial mode, no CRC, whitening OFF
     cc1101WriteReg(CC1101_PKTCTRL0, 0x30); 
     cc1101WriteReg(CC1101_MDMCFG4, 0xF7); 
     cc1101WriteReg(CC1101_MDMCFG3, 0x83); 
@@ -198,24 +194,19 @@ void cc1101StartCapture() {
     currentCapture.count = 0;
     currentCapture.startTime = millis();
     captureStartTime = currentCapture.startTime; 
-    currentFreqIndex = 0;  // Começa em 433.92MHz (mais comum)
+    currentFreqIndex = 0;
     currentCapture.frequency = captureFreqs[currentFreqIndex];
     lastFreqSwitch = millis();
     capture_state = STATE_HOPPING;
     isr_enabled = false;
     isr_count = 0;
-    capture_started = false;
-    // 0x0D = async serial data output (copia sinal ASK/OOK direto)
+    // CORREÇÃO: 0x0D = async serial data output (copia sinal ASK/OOK direto)
+    // ANTES usava 0x06 (RX FIFO fill) que nunca sinaliza para sinais OOK de controles
     cc1101WriteReg(CC1101_IOCFG0, 0x0D);
     pinMode(CC1101_GDO0, INPUT); 
     cc1101SetFrequency(currentCapture.frequency);
-    cc1101SendCommand(CC1101_SCAL); delay(1);  // Calibra VCO
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX); delay(10);
-    // Habilita ISR desde o início para detectar qualquer transição
-    isr_last_val = digitalRead(CC1101_GDO0);
-    isr_last_change = micros();
-    isr_enabled = true;
 }
 
 void cc1101CaptureLoop() {
@@ -224,32 +215,27 @@ void cc1101CaptureLoop() {
     unsigned long nowMs = millis();
 
     if (capture_state == STATE_HOPPING) {
-        // CORREÇÃO: usa capture_started (setado pela ISR) em vez de polling GDO0.
-        // ANTES fazia digitalRead(GDO0) que só pega o sinal se o loop passar
-        // exatamente durante um pulso HIGH de ~300μs. Com ISR ativa desde o início,
-        // qualquer transição detectada sinaliza que há um sinal presente.
-        if (capture_started && isr_count > 2) {
-            // Sinal detectado! Trava nesta frequência
-            capture_state = STATE_CAPTURING;
-            Serial.printf("[CC1101] Sinal detectado em %lu MHz! Capturando...\n", 
-                          currentCapture.frequency / 1000000);
+        if (digitalRead(CC1101_GDO0) == HIGH) {
+            capture_state = STATE_LOCKED;
         } 
-        else if (nowMs - lastFreqSwitch > 800) {  // 800ms por frequência (era 400)
-            // Sem sinal, troca de frequência
-            isr_enabled = false;
+        else if (nowMs - lastFreqSwitch > 400) {
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             cc1101SetFrequency(currentCapture.frequency);
-            cc1101SendCommand(CC1101_SCAL); delay(1);  // Calibra VCO
             cc1101SendCommand(CC1101_SIDLE); delay(1);
             cc1101SendCommand(CC1101_SRX); delay(5);
-            isr_count = 0;
-            capture_started = false;
-            isr_last_val = digitalRead(CC1101_GDO0);
-            isr_last_change = micros();
-            isr_enabled = true;
             lastFreqSwitch = nowMs;
         }
+    } 
+    else if (capture_state == STATE_LOCKED) {
+        // IOCFG0 já está em 0x0D desde StartCapture (não precisa reescrever)
+        delay(2); 
+        isr_count = 0;
+        isr_last_val = digitalRead(CC1101_GDO0);
+        isr_last_change = micros();
+        capture_started = false;
+        isr_enabled = true; 
+        capture_state = STATE_CAPTURING;
     } 
     else if (capture_state == STATE_CAPTURING) {
         bool silenceTimeout = (capture_started && (now - isr_last_change > 50000));
@@ -258,18 +244,14 @@ void cc1101CaptureLoop() {
         bool bufferFull = (isr_count >= 200);
 
         if (noiseTimeout) {
-            // Era ruído, volta para hopping
-            isr_enabled = false;
+            isr_enabled = false; 
+            // Mantém 0x0D (não volta para 0x06 que não detecta OOK)
             isr_count = 0;
             capture_started = false;
             capture_state = STATE_HOPPING;
-            isr_last_val = digitalRead(CC1101_GDO0);
             isr_last_change = micros();
-            isr_enabled = true;
-            lastFreqSwitch = nowMs;
         }
         else if ((capture_started && silenceTimeout) || bufferFull) {
-            // Captura completa!
             isr_enabled = false; 
             currentCapture.active = false;
             cc1101CopyActive = false;
@@ -291,13 +273,11 @@ void cc1101CaptureLoop() {
                 else if (sig->length > 50 || totalDuration > 70000) snprintf(sig->name, 16, "Carro %luM", sig->frequency / 1000000);
                 else snprintf(sig->name, 16, "Sinal %luM", sig->frequency / 1000000);
                 savedSignalCount++;
-                Serial.printf("[CC1101] Sinal capturado: %d timings, %lu MHz\n", 
-                              isr_count, currentCapture.frequency / 1000000);
             }
         } 
         else if (totalTimeout) {
-            // Timeout total - reinicia captura
             isr_enabled = false;
+            // Mantém 0x0D
             currentCapture.count = 0;
             currentCapture.startTime = millis();
             captureStartTime = millis(); 
@@ -308,12 +288,8 @@ void cc1101CaptureLoop() {
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             lastFreqSwitch = millis();
             cc1101SetFrequency(currentCapture.frequency);
-            cc1101SendCommand(CC1101_SCAL); delay(1);
             cc1101SendCommand(CC1101_SIDLE); delay(1);
             cc1101SendCommand(CC1101_SRX); delay(5);
-            isr_last_val = digitalRead(CC1101_GDO0);
-            isr_last_change = micros();
-            isr_enabled = true;
         }
     }
 }
