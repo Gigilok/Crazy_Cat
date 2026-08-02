@@ -100,7 +100,7 @@ extern void stopCameraFreeze();
 extern void initConnection(int);
 extern void setBrightness(uint8_t brightness);
 
-extern uint8_t* getPcapData(size_t* outLen);
+extern String getPcapData();
 
 // ============================================================
 // SERVER
@@ -179,8 +179,8 @@ static void handleNetworks() {
         JsonObject obj = nets.createNestedObject();
         obj["id"] = i;
         obj["ssid"] = net->ssid;
-        obj["channel"] = (int)net->channel;
-        obj["rssi"] = (int)net->rssi;
+        obj["channel"] = net->channel;
+        obj["rssi"] = net->rssi;
         obj["encrypted"] = net->encrypted;
         char bssid[18];
         snprintf(bssid, 18, "%02X:%02X:%02X:%02X:%02X:%02X",
@@ -200,15 +200,15 @@ static void handleScanNetworks() {
     DynamicJsonDocument doc(2048);
     doc["status"] = "ok";
     doc["message"] = "Scan complete";
-    doc["count"] = (int)networkCount;
+    doc["count"] = networkCount;
     JsonArray nets = doc.createNestedArray("networks");
     for (int i = 0; i < (int)networkCount; i++) {
         NetworkInfo* net = &scannedNetworks[i];
         JsonObject obj = nets.createNestedObject();
         obj["id"] = i;
         obj["ssid"] = net->ssid;
-        obj["channel"] = (int)net->channel;
-        obj["rssi"] = (int)net->rssi;
+        obj["channel"] = net->channel;
+        obj["rssi"] = net->rssi;
         obj["encrypted"] = net->encrypted;
         char bssid[18];
         snprintf(bssid, 18, "%02X:%02X:%02X:%02X:%02X:%02x",
@@ -265,18 +265,14 @@ static void handleHandshakeDownload() {
         sendERR("No handshake captured. Use Evil Twin first");
         return;
     }
-    size_t pcapLen = 0;
-    uint8_t* pcapData = getPcapData(&pcapLen);
-    if (pcapData == nullptr || pcapLen == 0) {
+    String pcapData = getPcapData();
+    if (pcapData.length() == 0) {
         sendERR("Failed to build PCAP file.");
         return;
     }
     apiServer.sendHeader("Content-Disposition", "attachment; filename=handshake.pcap");
-    apiServer.sendHeader("Content-Length", String(pcapLen));
     apiServer.sendHeader("Connection", "close");
-    apiServer.send(200, "application/vnd.tcpdump.pcap", "");
-    apiServer.sendContent((const char*)pcapData, pcapLen);
-    free(pcapData);
+    apiServer.send(200, "application/vnd.tcpdump.pcap", pcapData);
 }
 
 static void handleNRF24JammerStart() { if (!nrf24JammerActive) nrf24StartJammer(); sendOK("NRF24 Jammer started"); }
@@ -288,36 +284,21 @@ static void handleNRF24ScanData() {
     DynamicJsonDocument doc(512);
     const int8_t* bars = nrf24GetScanBarData();
     JsonArray arr = doc.createNestedArray("bars");
-    for (int i = 0; i < 16; i++) arr.add((int)bars[i]);
-    doc["packets"] = (uint32_t)nrf24GetScanTotalPackets();
+    for (int i = 0; i < 16; i++) arr.add(bars[i]);
+    doc["packets"] = nrf24GetScanTotalPackets();
     String out;
     serializeJson(doc, out);
     sendJSON(200, out);
 }
 
-// NOVO: scanner estilo Flipper (64 barras + peaks + waterfall)
+// NOVO: scanner estilo Flipper (64 barras + peaks)
 static void handleNRF24SpecData() {
-    DynamicJsonDocument doc(4096);
+    DynamicJsonDocument doc(2048);
     JsonArray barsArr  = doc.createNestedArray("bars");
     JsonArray peaksArr = doc.createNestedArray("peaks");
     for (int i = 0; i < 64; i++) {
         barsArr.add((int)nrf24SpecGetBarValue(i));
         peaksArr.add((int)nrf24SpecGetPeakValue(i));
-    }
-    JsonArray wfArr = doc.createNestedArray("waterfall");
-    for (int y = 0; y < 21; y++) {
-        String row = "";
-        for (int xByte = 0; xByte < 8; xByte++) {
-            char b = 0;
-            for (int bit = 0; bit < 8; bit++) {
-                int x = xByte * 8 + bit;
-                if (nrf24SpecGetWaterfallPixel(y, x)) b |= (char)(1 << bit);
-            }
-            char hex[3];
-            snprintf(hex, sizeof(hex), "%02X", (uint8_t)b);
-            row += hex;
-        }
-        wfArr.add(row);
     }
     doc["frames"]     = nrf24SpecGetFrames();
     doc["running"]    = nrf24SpecIsRunning();
@@ -435,7 +416,7 @@ static void handleBTDevices() {
         BTDevice* dev = getBTDevice(i);
         if (!dev) continue;
         JsonObject obj = arr.createNestedObject();
-        obj["id"] = i; obj["name"] = dev->name; obj["rssi"] = (int)dev->rssi;
+        obj["id"] = i; obj["name"] = dev->name; obj["rssi"] = dev->rssi;
     }
     String out; serializeJson(doc, out); sendJSON(200, out);
 }
@@ -636,14 +617,21 @@ extern void cc1101RollJamLoop();
 extern bool cc1101RollJamActive;
 extern void cc1101AnalyzerLoop();
 extern bool cc1101AnalyzerIsRunning();
-extern void portalLoop();
-extern bool isPortalActive();
+// NRF24 loops - ANTES faltavam, scanner não atualizava via APK
+extern int  nrf24JammerLoop();
+extern bool nrf24JammerActive;
+extern void nrf24SpecScan();
+extern void nrf24ScanLoop();
+extern bool nrf24IsScanning();
+extern void nrf24AnalyzeTick();
+extern bool nrf24IsAnalyzing();
+extern bool scannerRunning;
+// BruteForce loop
+extern void bfLoop();
+extern bool bfRunning;
 
 void apiLoop() {
     if (apiRunning) apiServer.handleClient();
-
-    // Processa captive portal (Evil Twin)
-    if (isPortalActive()) portalLoop();
 
     if (pendingDeauthStart) {
         pendingDeauthStart = false;
@@ -662,10 +650,18 @@ void apiLoop() {
         stopEvilTwin();
     }
 
-    // TOOL LOOPS: apenas CC1101 (NRF24 já é gerido pelo menu.cpp)
+    // TOOL LOOPS: CC1101 + NRF24 + BruteForce
+    // CORREÇÃO CRÍTICA: nrf24SpecScan() e nrf24ScanLoop() ANTES não eram
+    // chamados via API. Só rodavam dentro de renderNRF24Scanner() no menu.
+    // Quando o APK iniciava o scanner, os dados ficavam sempre zerados.
     if (cc1101CopyActive)              cc1101CaptureLoop();
     if (cc1101RollJamActive)           cc1101RollJamLoop();
     if (cc1101AnalyzerIsRunning())     cc1101AnalyzerLoop();
+    if (nrf24JammerActive)             nrf24JammerLoop();
+    if (scannerRunning)                nrf24SpecScan();
+    if (nrf24IsScanning())             nrf24ScanLoop();
+    if (nrf24IsAnalyzing())            nrf24AnalyzeTick();
+    if (bfRunning)                     bfLoop();
 }
 
 bool isAPIServerRunning() { return apiRunning; }
