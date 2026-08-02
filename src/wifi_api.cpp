@@ -322,6 +322,18 @@ static void handleCC1101Copy() {
     sendOK("CC1101 copy started");
 }
 
+// NOVO: endpoint para parar captura do CC1101
+static void handleCC1101CopyStop() {
+    cc1101StopCapture();
+    sendOK("CC1101 copy stopped");
+}
+
+// NOVO: endpoint para parar scan BLE
+static void handleBTScanStop() {
+    stopBTScan();
+    sendOK("BT scan stopped");
+}
+
 static void handleCC1101Replay() {
     if (!apiServer.hasArg("id")) { sendERR("Missing id"); return; }
     int idx = apiServer.arg("id").toInt();
@@ -408,7 +420,9 @@ static void handleCameraFreezeStart() { if (!cameraFreezeActive) startCameraFree
 static void handleCameraFreezeStop() { stopCameraFreeze(); sendOK("Camera freeze stopped"); }
 
 static void handleBTScan() {
-    if (!isBLEAvailable()) { sendERR("BLE not available"); return; }
+    // CORREÇÃO: não bloqueia se BLE não inicializado.
+    // startBTScan() faz auto-init (chama bluetoothInit() se necessário).
+    // Antes o APK recebia "BLE not available" e não conseguia escanear.
     if (isBTScanning()) { sendERR("Scan already in progress"); return; }
     btDeviceCount = 0; startBTScan(); sendOK("BT scan started (15s async)");
 }
@@ -426,11 +440,16 @@ static void handleBTDevices() {
 }
 
 static void handleBTJammerStart() {
-    if (!isBLEAvailable()) { sendERR("BLE not available"); return; }
+    // CORREÇÃO: não bloqueia se BLE não inicializado.
+    // startBTJammer() faz auto-init via bluetoothInit().
     if (!apiServer.hasArg("id")) { sendERR("Missing id"); return; }
     int idx = apiServer.arg("id").toInt();
-    if (idx < (int)btDeviceCount) { startBTJammer(idx); sendOK("BT jammer started"); } 
-    else { sendERR("Invalid device id"); }
+    // Se não tem dispositivos escaneados, permite mesmo assim (jammer é broadcast)
+    if (idx < (int)btDeviceCount || btDeviceCount == 0) {
+        startBTJammer(idx); sendOK("BT jammer started");
+    } else {
+        sendERR("Invalid device id");
+    }
 }
 static void handleBTJammerStop() { stopBTJammer(); sendOK("BT jammer stopped"); }
 
@@ -567,6 +586,7 @@ void startAPIServer() {
     apiServer.on("/api/nrf24/scan", HTTP_GET, handleNRF24ScanData);
     apiServer.on("/api/nrf24/spec", HTTP_GET, handleNRF24SpecData);
     apiServer.on("/api/cc1101/copy", HTTP_POST, handleCC1101Copy);
+    apiServer.on("/api/cc1101/copy/stop", HTTP_POST, handleCC1101CopyStop);
     apiServer.on("/api/cc1101/replay", HTTP_POST, handleCC1101Replay);
     apiServer.on("/api/cc1101/signals", HTTP_GET, handleCC1101Signals);
     apiServer.on("/api/cc1101/raw", HTTP_GET, handleCC1101GetRaw);
@@ -584,6 +604,7 @@ void startAPIServer() {
     apiServer.on("/api/attack/camera/freeze/start", HTTP_POST, handleCameraFreezeStart);
     apiServer.on("/api/attack/camera/freeze/stop", HTTP_POST, handleCameraFreezeStop);
     apiServer.on("/api/attack/bt/scan", HTTP_POST, handleBTScan);
+    apiServer.on("/api/attack/bt/scan/stop", HTTP_POST, handleBTScanStop);
     apiServer.on("/api/attack/bt/devices", HTTP_GET, handleBTDevices);
     apiServer.on("/api/attack/bt/jammer/start", HTTP_POST, handleBTJammerStart);
     apiServer.on("/api/attack/bt/jammer/stop", HTTP_POST, handleBTJammerStop);
