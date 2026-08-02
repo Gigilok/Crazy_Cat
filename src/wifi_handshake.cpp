@@ -158,25 +158,22 @@ void clearHandshakeBuffer() {
 // ============================================================
 // EXPORTAR PARA PCAP (Para o Termux quebrar a senha)
 // ============================================================
-String getPcapData() {
-    size_t totalSize = 24; // Global header size
+uint8_t* getPcapData(size_t* outLen) {
+    if (outLen == nullptr) return nullptr;
+    
+    size_t totalSize = 24;
     for (int i = 0; i < eapolCount; i++) {
-        totalSize += 16 + eapolBuffer[i].len; // Packet header + data
+        totalSize += 16 + eapolBuffer[i].len;
     }
     
     uint8_t* buf = (uint8_t*)malloc(totalSize);
-    if (!buf) return "";
+    if (!buf) { *outLen = 0; return nullptr; }
     
     size_t offset = 0;
-    
-    // PCAP Global Header (Little Endian)
     uint32_t magic = 0xa1b2c3d4;
-    uint16_t verMaj = 2;
-    uint16_t verMin = 4;
+    uint16_t verMaj = 2, verMin = 4;
     int32_t tz = 0;
-    uint32_t sigfigs = 0;
-    uint32_t snaplen = 65535;
-    uint32_t network = 105; // LINKTYPE_IEEE802_11
+    uint32_t sigfigs = 0, snaplen = 65535, network = 105;
     
     memcpy(&buf[offset], &magic, 4); offset += 4;
     memcpy(&buf[offset], &verMaj, 2); offset += 2;
@@ -186,24 +183,17 @@ String getPcapData() {
     memcpy(&buf[offset], &snaplen, 4); offset += 4;
     memcpy(&buf[offset], &network, 4); offset += 4;
     
-    // Pacotes
     for (int i = 0; i < eapolCount; i++) {
         EapolFrame* f = &eapolBuffer[i];
-        
-        uint32_t ts_sec = f->ts_sec;
-        uint32_t ts_usec = f->ts_usec;
-        uint32_t incl_len = f->len;
-        uint32_t orig_len = f->len;
-        
+        uint32_t ts_sec = f->ts_sec, ts_usec = f->ts_usec;
+        uint32_t incl_len = f->len, orig_len = f->len;
         memcpy(&buf[offset], &ts_sec, 4); offset += 4;
         memcpy(&buf[offset], &ts_usec, 4); offset += 4;
         memcpy(&buf[offset], &incl_len, 4); offset += 4;
         memcpy(&buf[offset], &orig_len, 4); offset += 4;
-        
         memcpy(&buf[offset], f->data, f->len); offset += f->len;
     }
     
-    String result = String((const char*)buf, totalSize);
-    free(buf);
-    return result;
+    *outLen = totalSize;
+    return buf;
 }
