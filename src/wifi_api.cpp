@@ -100,7 +100,7 @@ extern void stopCameraFreeze();
 extern void initConnection(int);
 extern void setBrightness(uint8_t brightness);
 
-extern String getPcapData();
+extern uint8_t* getPcapData(size_t* outLen);
 
 // ============================================================
 // SERVER
@@ -265,14 +265,18 @@ static void handleHandshakeDownload() {
         sendERR("No handshake captured. Use Evil Twin first");
         return;
     }
-    String pcapData = getPcapData();
-    if (pcapData.length() == 0) {
+    size_t pcapLen = 0;
+    uint8_t* pcapData = getPcapData(&pcapLen);
+    if (pcapData == nullptr || pcapLen == 0) {
         sendERR("Failed to build PCAP file.");
         return;
     }
     apiServer.sendHeader("Content-Disposition", "attachment; filename=handshake.pcap");
+    apiServer.sendHeader("Content-Length", String(pcapLen));
     apiServer.sendHeader("Connection", "close");
-    apiServer.send(200, "application/vnd.tcpdump.pcap", pcapData);
+    apiServer.send(200, "application/vnd.tcpdump.pcap", "");
+    apiServer.sendContent((const char*)pcapData, pcapLen);
+    free(pcapData);
 }
 
 static void handleNRF24JammerStart() { if (!nrf24JammerActive) nrf24StartJammer(); sendOK("NRF24 Jammer started"); }
