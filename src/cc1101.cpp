@@ -132,15 +132,6 @@ void cc1101SetFrequency(uint32_t freqHz) {
     cc1101WriteReg(CC1101_FREQ0, freqWord & 0xFF);
 }
 
-// Helper interno: seta frequencia e recalibra o VCO (CC1101_SCAL)
-// Sem isso, o sintetizador pode transmitir em frequencia/potencia errada
-// nas primeiras transmissões após mudar de freq.
-static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
-    cc1101SetFrequency(freqHz);
-    cc1101SendCommand(CC1101_SCAL);
-    delay(1);
-}
-
 bool cc1101Init() {
     Serial.println("[CC1101] Inicializando...");
     spiCC1101.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
@@ -207,7 +198,9 @@ void cc1101StartCapture() {
     capture_state = STATE_HOPPING;
     isr_enabled = false;
     isr_count = 0;
-    cc1101WriteReg(CC1101_IOCFG0, 0x06); 
+    // CORREÇÃO: 0x0D = async serial data output (copia sinal ASK/OOK direto)
+    // ANTES usava 0x06 (RX FIFO fill) que nunca sinaliza para sinais OOK de controles
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
     pinMode(CC1101_GDO0, INPUT); 
     cc1101SetFrequency(currentCapture.frequency);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
@@ -233,7 +226,8 @@ void cc1101CaptureLoop() {
         }
     } 
     else if (capture_state == STATE_LOCKED) {
-        cc1101WriteReg(CC1101_IOCFG0, 0x0D); delay(2); 
+        // IOCFG0 já está em 0x0D desde StartCapture (não precisa reescrever)
+        delay(2); 
         isr_count = 0;
         isr_last_val = digitalRead(CC1101_GDO0);
         isr_last_change = micros();
@@ -249,7 +243,7 @@ void cc1101CaptureLoop() {
 
         if (noiseTimeout) {
             isr_enabled = false; 
-            cc1101WriteReg(CC1101_IOCFG0, 0x06); 
+            // Mantém 0x0D (não volta para 0x06 que não detecta OOK)
             isr_count = 0;
             capture_started = false;
             capture_state = STATE_HOPPING;
@@ -281,7 +275,7 @@ void cc1101CaptureLoop() {
         } 
         else if (totalTimeout) {
             isr_enabled = false;
-            cc1101WriteReg(CC1101_IOCFG0, 0x06);
+            // Mantém 0x0D
             currentCapture.count = 0;
             currentCapture.startTime = millis();
             captureStartTime = millis(); 
@@ -315,13 +309,11 @@ void cc1101ReplaySignal(uint8_t index) {
     if (!cc1101Initialized) return;
     isr_enabled = false; 
     SignalData* sig = &savedSignals[index];
-    // CORREÇÃO: SCAL obriga recalibração do VCO para a frequencia alvo
-    cc1101SetFrequencyCalibrated(sig->frequency);
+    cc1101SetFrequency(sig->frequency); 
     cc1101WriteReg(CC1101_IOCFG0, 0x2E); 
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_STX); delay(1); 
     pinMode(CC1101_GDO0, OUTPUT);
-    digitalWrite(CC1101_GDO0, LOW); // estado inicial definido
     for (int i = 0; i < sig->length; i++) {
         digitalWrite(CC1101_GDO0, i % 2 == 0 ? HIGH : LOW);
         delayMicroseconds(sig->timings[i]);
@@ -335,13 +327,11 @@ void cc1101ReplaySignal(uint8_t index) {
 void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
     if (!cc1101Initialized) return;
     isr_enabled = false; 
-    // CORREÇÃO: recalibra VCO antes de transmitir
-    cc1101SetFrequencyCalibrated(freq);
+    cc1101SetFrequency(freq);
     cc1101WriteReg(CC1101_IOCFG0, 0x2E); 
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_STX); delay(1);
     pinMode(CC1101_GDO0, OUTPUT);
-    digitalWrite(CC1101_GDO0, LOW);
     for (int rep = 0; rep < 3; rep++) {
         for (int i = 23; i >= 0; i--) {
             bool bit = (code >> i) & 0x01;
@@ -369,8 +359,7 @@ void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
 void cc1101StartSubGHzJammer() {
     if (!cc1101Initialized) return;
     isr_enabled = false;
-    // CORREÇÃO: SCAL obriga recalibração do VCO para 433.92MHz
-    cc1101SetFrequencyCalibrated(433920000);
+    cc1101SetFrequency(433920000);
     cc1101WriteReg(CC1101_IOCFG0, 0x2E); 
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_STX); delay(1);
@@ -390,7 +379,6 @@ void cc1101StopSubGHzJammer() {
 // ROLLJAM AUTO (TÉCNICA CATCH AND JAM - ESTILO FLIPPER ZERO)
 // ============================================================
 
-// CORREÇÃO: RollJam agora recalibra VCO ao trocar de RX para TX
 void cc1101StartRollJam() {
     if (!cc1101Initialized) return;
     cc1101RollJamActive = true;
@@ -399,7 +387,7 @@ void cc1101StartRollJam() {
     currentCapture.frequency = 433920000; 
     
     isr_enabled = false;
-    cc1101SetFrequencyCalibrated(currentCapture.frequency);
+    cc1101SetFrequency(currentCapture.frequency);
     
     cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
     pinMode(CC1101_GDO0, INPUT);
@@ -425,11 +413,9 @@ void cc1101RollJamLoop() {
         }
     } 
     else if (rj_state == 1) {
-        // Captura encerrada - agora bloqueia (jamming) o segundo sinal
         if (now - rj_timer > 200) {
             isr_enabled = false; 
-            // Recalibra VCO antes de transmitir (já estamos na mesma freq)
-            cc1101SendCommand(CC1101_SCAL); delay(1);
+            
             cc1101WriteReg(CC1101_IOCFG0, 0x2E); 
             cc1101SendCommand(CC1101_SIDLE); delay(1);
             cc1101SendCommand(CC1101_STX); 
@@ -480,14 +466,11 @@ void cc1101StartAnalyzer() {
     spec_an_running = true;
     spec_an_idx = 0;
     
-    // Bandas validas do CC1101: 300-348 / 387-464 / 779-928 MHz
     for(int i=0; i<15; i++) spec_an_freqs[i] = 300000000 + (i * 3200000);
     for(int i=0; i<16; i++) spec_an_freqs[15+i] = 387000000 + (i * 4800000);
     for(int i=0; i<33; i++) spec_an_freqs[31+i] = 779000000 + (i * 4500000);
     
     for(int i=0; i<64; i++) spec_an_values[i] = 0; 
-    // Calibra para a primeira frequencia
-    cc1101SetFrequencyCalibrated(spec_an_freqs[0]);
 }
 
 void cc1101AnalyzerLoop() {
@@ -498,8 +481,7 @@ void cc1101AnalyzerLoop() {
     }
 
     uint32_t freq = spec_an_freqs[spec_an_idx];
-    // CORREÇÃO: recalibra VCO a cada mudanca de frequencia
-    cc1101SetFrequencyCalibrated(freq);
+    cc1101SetFrequency(freq);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX);
     delayMicroseconds(300); 
@@ -554,17 +536,15 @@ void cc1101DeleteSignal(uint8_t index) {
     Serial.println("[CC1101] Sinal individual excluido.");
 }
 
-// Transmitir sinais gerados pelo Termux (Keeloq)
+// NOVA FUNÇÃO: Transmitir sinais gerados pelo Termux (Keeloq)
 void cc1101TransmitRaw(uint32_t frequency, uint16_t* timings, uint8_t length) {
     if (!cc1101Initialized || length == 0 || length > 200) return;
     isr_enabled = false; 
-    // CORREÇÃO: recalibra VCO para a frequencia alvo
-    cc1101SetFrequencyCalibrated(frequency);
+    cc1101SetFrequency(frequency);
     cc1101WriteReg(CC1101_IOCFG0, 0x2E); 
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_STX); delay(1); 
     pinMode(CC1101_GDO0, OUTPUT);
-    digitalWrite(CC1101_GDO0, LOW);
     for (int i = 0; i < length; i++) {
         digitalWrite(CC1101_GDO0, i % 2 == 0 ? HIGH : LOW);
         delayMicroseconds(timings[i]);
@@ -586,24 +566,21 @@ int8_t cc1101GetDroneRSSI() {
     int persistentHits = 0;
     for(int freq=0; freq<2; freq++) {
         cc1101SendCommand(CC1101_SIDLE);
-        // CORREÇÃO: recalibra VCO para cada frequencia
-        if(freq==0) cc1101SetFrequencyCalibrated(868000000);
-        else cc1101SetFrequencyCalibrated(915000000);
+        if(freq==0) cc1101SetFrequency(868000000);
+        else cc1101SetFrequency(915000000);
         cc1101SendCommand(CC1101_SRX);
         delayMicroseconds(500); 
         for(int i=0; i<3; i++) {
             uint8_t rssiDec = cc1101ReadStatus(CC1101_RSSI);
             int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
             if (rssi > maxRssiDbm) maxRssiDbm = rssi;
-            // CORREÇÃO: threshold mais flexivel (-75 em vez de -70) para drones distantes
-            if (rssi > -75) persistentHits++; 
+            if (rssi > -70) persistentHits++; 
             delay(5); 
         }
     }
     cc1101SendCommand(CC1101_SIDLE);
-    // CORREÇÃO: 2 hits já indicam presença (era 3)
-    if (persistentHits < 2) return 0;
-    if (maxRssiDbm < -70) return 0;
+    if (persistentHits < 3) return 0;
+    if (maxRssiDbm < -65) return 0;
     if (maxRssiDbm > -30) return 100;
-    return map(maxRssiDbm, -70, -30, 1, 100);
+    return map(maxRssiDbm, -65, -30, 1, 100);
 }
