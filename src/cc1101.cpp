@@ -152,10 +152,6 @@ bool cc1101Init() {
 
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
 
-    // CORREÇÃO: pull-down no GDO0 para evitar flutuação quando não há sinal
-    // Sem isso, o pino flutua e gera transições falsas na ISR
-    pinMode(CC1101_GDO0, INPUT_PULLDOWN);
-
     cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
     cc1101WriteReg(CC1101_FIFOTHR, 0x47);
     // CORREÇÃO: whitening OFF (0x30) - 0x32 corrompe captura OOK
