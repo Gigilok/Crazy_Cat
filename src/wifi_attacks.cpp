@@ -411,10 +411,18 @@ void startEvilTwin(uint8_t networkIndex) {
     cloneHealthCheckFailures = 0;
 
     startHandshakeCapture();
+    
+    // Ativa captive portal (server(80) já existe no wifi_portal.cpp)
+    extern void startPortal(const char* ssid);
+    startPortal(cloneSSID);
+    Serial.printf("[EvilTwin] Portal ativo: %s\n", cloneSSID);
 }
 
 void stopEvilTwin() {
     if (!evilTwinActive && !deauthActive) return; 
+    
+    extern void stopPortal();
+    stopPortal();
     
     deauthActive = false;
     evilTwinActive = false;
