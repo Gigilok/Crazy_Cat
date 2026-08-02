@@ -152,6 +152,10 @@ bool cc1101Init() {
 
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
 
+    // CORREÇÃO: pull-down no GDO0 para evitar flutuação quando não há sinal
+    // Sem isso, o pino flutua e gera transições falsas na ISR
+    pinMode(CC1101_GDO0, INPUT_PULLDOWN);
+
     cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
     cc1101WriteReg(CC1101_FIFOTHR, 0x47);
     // CORREÇÃO: whitening OFF (0x30) - 0x32 corrompe captura OOK
@@ -165,13 +169,10 @@ bool cc1101Init() {
     cc1101WriteReg(CC1101_MCSM0, 0x18);
     cc1101WriteReg(CC1101_FOCCFG, 0x16);
     cc1101WriteReg(CC1101_BSCFG, 0x6C);
-    // CORREÇÃO: AGC otimizado para OOK (estilo Flipper Zero)
-    // ANTES era 0x43/0x40/0x91 (config para FSK, não detecta OOK direito)
-    // 0x07 = max LNA + max DVGA, target amplitude 42dB
-    // 0x00 = LNA decision boundary 0
-    // 0x91 = zero crossing (mantém)
-    cc1101WriteReg(CC1101_AGCCTRL2, 0x07);
-    cc1101WriteReg(CC1101_AGCCTRL1, 0x00);
+    // AGC adaptativo padrão (igual Flipper Zero e rc-switch)
+    // NÃO usar 0x07 (ganho máximo) - capta ruído como sinal
+    cc1101WriteReg(CC1101_AGCCTRL2, 0x43);
+    cc1101WriteReg(CC1101_AGCCTRL1, 0x40);
     cc1101WriteReg(CC1101_AGCCTRL0, 0x91);
     cc1101WriteReg(CC1101_FREND0, 0x11);
     cc1101WriteReg(CC1101_FSCAL3, 0xE9);
@@ -497,25 +498,27 @@ void cc1101AnalyzerLoop() {
 
     uint32_t freq = spec_an_freqs[spec_an_idx];
     cc1101SetFrequency(freq);
-    // CORREÇÃO: SCAL recalibra VCO para cada frequência do analisador
-    // ANTES não tinha SCAL, e o VCO continuava calibrado para freq anterior
-    // fazendo o RSSI ser sempre o mesmo (sem sinal real)
+    // SCAL recalibra VCO para cada frequência
     cc1101SendCommand(CC1101_SCAL); delay(1);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX);
-    delayMicroseconds(500);  // ANTES era 300μs (muito pouco para AGC estabilizar)
+    // CORREÇÃO: 1ms de settle time (era 500μs) - AGC precisa de tempo
+    // para estabilizar e ler RSSI real, não ruído de transição
+    delay(1);
 
     uint8_t rssiDec = cc1101ReadStatus(CC1101_RSSI);
-    // CORREÇÃO: fórmula RSSI do datasheet do CC1101
-    // RSSI_dBm = (rssiDec >= 128) ? (rssiDec-256)/2 - RSSI_OFFSET : rssiDec/2 - RSSI_OFFSET
-    // RSSI_OFFSET = 74 dB para 868/915MHz, 81 dB para 433MHz
-    // Para simplicidade usamos 74 (próximo o suficiente)
+    // Fórmula RSSI do datasheet do CC1101
     int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
     
-    if (rssi < -100) rssi = -100;
+    // CORREÇÃO: só mostra sinal se RSSI > -80dBm (era -90)
+    // Ruído de fundo costuma estar entre -100 e -85dBm
+    // Sinais reais de controles ficam entre -70 e -30dBm
+    if (rssi < -90) rssi = -90;
     if (rssi > -30) rssi = -30;
     
-    uint16_t target_h = map(rssi, -100, -30, 0, 40);
+    uint16_t target_h = map(rssi, -90, -30, 0, 40);
+    // CORREÇÃO: threshold mínimo para mostrar barra (evita ruído fantasma)
+    if (rssi < -80) target_h = 0;
     if (target_h > spec_an_values[spec_an_idx]) {
         spec_an_values[spec_an_idx] = target_h;
     }
