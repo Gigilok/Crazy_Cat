@@ -89,7 +89,7 @@ uint32_t spec_an_freqs[64];
 uint8_t spec_an_idx = 0;
 bool spec_an_running = false;
 
-void cc1101ISR() {
+void IRAM_ATTR cc1101ISR() {
     if (!isr_enabled) return; 
     unsigned long now = micros();
     uint8_t val = digitalRead(CC1101_GDO0);
