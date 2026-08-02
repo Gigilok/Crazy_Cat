@@ -154,8 +154,7 @@ bool cc1101Init() {
 
     cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
     cc1101WriteReg(CC1101_FIFOTHR, 0x47);
-    // Whitening OFF: 0x32 tem whitening ON que corrompe captura RAW de OOK
-    // 0x30 = serial mode, no CRC, whitening OFF
+    // CORREÇÃO: whitening OFF (0x30) - 0x32 corrompe captura OOK
     cc1101WriteReg(CC1101_PKTCTRL0, 0x30); 
     cc1101WriteReg(CC1101_MDMCFG4, 0xF7); 
     cc1101WriteReg(CC1101_MDMCFG3, 0x83); 
@@ -166,8 +165,13 @@ bool cc1101Init() {
     cc1101WriteReg(CC1101_MCSM0, 0x18);
     cc1101WriteReg(CC1101_FOCCFG, 0x16);
     cc1101WriteReg(CC1101_BSCFG, 0x6C);
-    cc1101WriteReg(CC1101_AGCCTRL2, 0x43);
-    cc1101WriteReg(CC1101_AGCCTRL1, 0x40);
+    // CORREÇÃO: AGC otimizado para OOK (estilo Flipper Zero)
+    // ANTES era 0x43/0x40/0x91 (config para FSK, não detecta OOK direito)
+    // 0x07 = max LNA + max DVGA, target amplitude 42dB
+    // 0x00 = LNA decision boundary 0
+    // 0x91 = zero crossing (mantém)
+    cc1101WriteReg(CC1101_AGCCTRL2, 0x07);
+    cc1101WriteReg(CC1101_AGCCTRL1, 0x00);
     cc1101WriteReg(CC1101_AGCCTRL0, 0x91);
     cc1101WriteReg(CC1101_FREND0, 0x11);
     cc1101WriteReg(CC1101_FSCAL3, 0xE9);
@@ -200,11 +204,13 @@ void cc1101StartCapture() {
     capture_state = STATE_HOPPING;
     isr_enabled = false;
     isr_count = 0;
-    // CORREÇÃO: 0x0D = async serial data output (copia sinal ASK/OOK direto)
-    // ANTES usava 0x06 (RX FIFO fill) que nunca sinaliza para sinais OOK de controles
+    // 0x0D = async serial data output (copia sinal ASK/OOK direto pro GDO0)
     cc1101WriteReg(CC1101_IOCFG0, 0x0D);
     pinMode(CC1101_GDO0, INPUT); 
     cc1101SetFrequency(currentCapture.frequency);
+    // CORREÇÃO: SCAL recalibra VCO para a frequência inicial
+    // Sem isso o VCO pode estar calibrado para freq errada e não detectar sinal
+    cc1101SendCommand(CC1101_SCAL); delay(1);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX); delay(10);
 }
@@ -215,13 +221,18 @@ void cc1101CaptureLoop() {
     unsigned long nowMs = millis();
 
     if (capture_state == STATE_HOPPING) {
+        // CORREÇÃO: com AGC otimizado (0x07), GDO0 fica HIGH quando há sinal OOK
         if (digitalRead(CC1101_GDO0) == HIGH) {
             capture_state = STATE_LOCKED;
+            Serial.printf("[CC1101] Sinal detectado em %lu MHz\n", currentCapture.frequency / 1000000);
         } 
-        else if (nowMs - lastFreqSwitch > 400) {
+        // CORREÇÃO: 1000ms por frequência (era 400) - mais tempo para o usuário apertar o controle
+        else if (nowMs - lastFreqSwitch > 1000) {
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             cc1101SetFrequency(currentCapture.frequency);
+            // CORREÇÃO: SCAL recalibra VCO a cada troca de frequência
+            cc1101SendCommand(CC1101_SCAL); delay(1);
             cc1101SendCommand(CC1101_SIDLE); delay(1);
             cc1101SendCommand(CC1101_SRX); delay(5);
             lastFreqSwitch = nowMs;
@@ -288,6 +299,8 @@ void cc1101CaptureLoop() {
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             lastFreqSwitch = millis();
             cc1101SetFrequency(currentCapture.frequency);
+            // CORREÇÃO: SCAL recalibra VCO ao reiniciar captura
+            cc1101SendCommand(CC1101_SCAL); delay(1);
             cc1101SendCommand(CC1101_SIDLE); delay(1);
             cc1101SendCommand(CC1101_SRX); delay(5);
         }
@@ -484,17 +497,25 @@ void cc1101AnalyzerLoop() {
 
     uint32_t freq = spec_an_freqs[spec_an_idx];
     cc1101SetFrequency(freq);
+    // CORREÇÃO: SCAL recalibra VCO para cada frequência do analisador
+    // ANTES não tinha SCAL, e o VCO continuava calibrado para freq anterior
+    // fazendo o RSSI ser sempre o mesmo (sem sinal real)
+    cc1101SendCommand(CC1101_SCAL); delay(1);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX);
-    delayMicroseconds(300); 
+    delayMicroseconds(500);  // ANTES era 300μs (muito pouco para AGC estabilizar)
 
     uint8_t rssiDec = cc1101ReadStatus(CC1101_RSSI);
+    // CORREÇÃO: fórmula RSSI do datasheet do CC1101
+    // RSSI_dBm = (rssiDec >= 128) ? (rssiDec-256)/2 - RSSI_OFFSET : rssiDec/2 - RSSI_OFFSET
+    // RSSI_OFFSET = 74 dB para 868/915MHz, 81 dB para 433MHz
+    // Para simplicidade usamos 74 (próximo o suficiente)
     int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
     
-    if (rssi < -90) rssi = -90;
-    if (rssi > -50) rssi = -50;
+    if (rssi < -100) rssi = -100;
+    if (rssi > -30) rssi = -30;
     
-    uint16_t target_h = map(rssi, -90, -50, 0, 40);
+    uint16_t target_h = map(rssi, -100, -30, 0, 40);
     if (target_h > spec_an_values[spec_an_idx]) {
         spec_an_values[spec_an_idx] = target_h;
     }
