@@ -187,8 +187,36 @@ bool cc1101Init() {
     cc1101Initialized = true;
     Serial.println("[CC1101] Configurado com sucesso!");
     
-    // === DIAGNÓSTICO: lê de volta os registradores críticos ===
-    Serial.println("[CC1101] === DIAGNÓSTICO DE REGISTRADORES ===");
+    // === DIAGNÓSTICO COMPLETO ===
+    Serial.println("[CC1101] === DIAGNÓSTICO COMPLETO ===");
+    
+    // Teste 1: ler status byte + PARTNUM + VERSION
+    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    cc1101Select();
+    uint8_t status1 = spiCC1101.transfer(0x30 | 0xC0);  // READ_BURST PARTNUM
+    uint8_t partnum_val = spiCC1101.transfer(0x00);
+    cc1101Deselect();
+    spiCC1101.endTransaction();
+    
+    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    cc1101Select();
+    uint8_t status2 = spiCC1101.transfer(0x31 | 0xC0);  // READ_BURST VERSION
+    uint8_t version_val = spiCC1101.transfer(0x00);
+    cc1101Deselect();
+    spiCC1101.endTransaction();
+    
+    Serial.printf("  STATUS BYTE (PARTNUM) = 0x%02X (bit7=CHIP_RDYn, 0=pronto)\n", status1);
+    Serial.printf("  STATUS BYTE (VERSION) = 0x%02X\n", status2);
+    Serial.printf("  PARTNUM  = 0x%02X (esperado 0x00)\n", partnum_val);
+    Serial.printf("  VERSION  = 0x%02X (esperado 0x04 ou 0x14)\n", version_val);
+    
+    // Teste 2: write-readback para verificar se SPI write funciona
+    cc1101WriteReg(0x02, 0xAB);  // escreve 0xAB no IOCFG0
+    uint8_t readback = cc1101ReadReg(0x02);  // lê de volta
+    Serial.printf("  WRITE-READBACK: escreveu 0xAB no IOCFG0, leu 0x%02X\n", readback);
+    cc1101WriteReg(0x02, 0x0D);  // restaura valor correto
+    
+    // Teste 3: ler registradores de configuração
     Serial.printf("  IOCFG0    = 0x%02X (esperado 0x0D)\n", cc1101ReadReg(0x02));
     Serial.printf("  PKTCTRL0  = 0x%02X (esperado 0x32)\n", cc1101ReadReg(0x08));
     Serial.printf("  MDMCFG4   = 0x%02X (esperado 0x17)\n", cc1101ReadReg(0x10));
@@ -198,9 +226,7 @@ bool cc1101Init() {
     Serial.printf("  FREQ2     = 0x%02X\n", cc1101ReadReg(0x0D));
     Serial.printf("  FREQ1     = 0x%02X\n", cc1101ReadReg(0x0E));
     Serial.printf("  FREQ0     = 0x%02X\n", cc1101ReadReg(0x0F));
-    Serial.printf("  PARTNUM   = 0x%02X\n", cc1101ReadStatus(0x30));
-    Serial.printf("  VERSION   = 0x%02X\n", cc1101ReadStatus(0x31));
-    Serial.printf("  MARCSTATE = 0x%02X (0x0D=RX, 0x01=IDLE)\n", cc1101ReadStatus(0x35) & 0x1F);
+    Serial.printf("  MARCSTATE = 0x%02X (0x0D=RX, 0x01=IDLE, 0x00=SLEEP)\n", cc1101ReadStatus(0x35) & 0x1F);
     Serial.printf("  GDO0 pin  = %d\n", digitalRead(CC1101_GDO0));
     Serial.println("[CC1101] === FIM DO DIAGNÓSTICO ===");
     Serial.flush();
