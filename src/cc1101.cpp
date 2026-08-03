@@ -192,15 +192,14 @@ bool cc1101Init() {
     Serial.println("[CC1101] === DIAGNÓSTICO COMPLETO ===");
     
     // Teste 1: ler status byte + PARTNUM + VERSION
-    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    // NOTA: cc1101Select() já faz beginTransaction, não duplicar
     cc1101Select();
-    uint8_t status1 = spiCC1101.transfer(0x30 | 0xC0);  // READ_BURST PARTNUM
+    uint8_t status1 = spiCC1101.transfer(0x30 | 0xC0);
     uint8_t partnum_val = spiCC1101.transfer(0x00);
     cc1101Deselect();
     
-    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     cc1101Select();
-    uint8_t status2 = spiCC1101.transfer(0x31 | 0xC0);  // READ_BURST VERSION
+    uint8_t status2 = spiCC1101.transfer(0x31 | 0xC0);
     uint8_t version_val = spiCC1101.transfer(0x00);
     cc1101Deselect();
     
