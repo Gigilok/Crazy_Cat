@@ -152,12 +152,7 @@ bool cc1101Init() {
 
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
 
-    // CORREÇÃO: IOCFG0=0x0E (Carrier Sense) em vez de 0x0D (async data).
-    // Com 0x0D, GDO0 oscila com ruído mesmo sem sinal (confirmado por RadioLib).
-    // Com 0x0E, GDO0 fica LOW em silêncio e HIGH apenas quando há sinal real.
-    // Isso permite usar digitalRead(GDO0) para detectar presença de sinal.
-    // Durante a captura (STATE_LOCKED), trocamos para 0x0D para pegar os timings.
-    cc1101WriteReg(CC1101_IOCFG0, 0x0E); 
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
     cc1101WriteReg(CC1101_FIFOTHR, 0x47);
     cc1101WriteReg(CC1101_PKTCTRL0, 0x32); 
     cc1101WriteReg(CC1101_MDMCFG4, 0xF7); 
@@ -170,9 +165,7 @@ bool cc1101Init() {
     cc1101WriteReg(CC1101_FOCCFG, 0x16);
     cc1101WriteReg(CC1101_BSCFG, 0x6C);
     cc1101WriteReg(CC1101_AGCCTRL2, 0x43);
-    // CORREÇÃO: Carrier Sense relativo +6dB evita falsos disparos por ruído
-    // Bit 4:3 = CARRIER_SENSE_REL_THR = 10 (+6dB acima do ruído de fundo)
-    cc1101WriteReg(CC1101_AGCCTRL1, 0x10);
+    cc1101WriteReg(CC1101_AGCCTRL1, 0x40);
     cc1101WriteReg(CC1101_AGCCTRL0, 0x91);
     cc1101WriteReg(CC1101_FREND0, 0x11);
     cc1101WriteReg(CC1101_FSCAL3, 0xE9);
@@ -203,16 +196,20 @@ void cc1101StartCapture() {
     currentCapture.frequency = captureFreqs[currentFreqIndex];
     lastFreqSwitch = millis();
     capture_state = STATE_HOPPING;
-    isr_enabled = false;
     isr_count = 0;
-    // IOCFG0=0x0E (Carrier Sense) para detectar presença de sinal.
-    // GDO0 fica LOW em silêncio, HIGH quando há sinal acima do threshold.
-    cc1101WriteReg(CC1101_IOCFG0, 0x0E);
+    capture_started = false;
+    // CORREÇÃO: IOCFG0=0x0D mantém GDO0 como saída de dados assíncronos.
+    // A ISR é ativada desde o início para contar transições (mesmo no HOPPING).
+    // Se isr_count > 5 em menos de 100ms, há sinal real (não é só ruído).
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
     pinMode(CC1101_GDO0, INPUT); 
     cc1101SetFrequency(currentCapture.frequency);
-    // MCSM0=0x18 já tem FS_AUTOCAL=01 — calibra automaticamente no SIDLE->SRX
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX); delay(10);
+    // Habilita ISR desde o início — ela só conta transições, não causa bootloop
+    isr_last_val = digitalRead(CC1101_GDO0);
+    isr_last_change = micros();
+    isr_enabled = true;
 }
 
 void cc1101CaptureLoop() {
@@ -221,23 +218,31 @@ void cc1101CaptureLoop() {
     unsigned long nowMs = millis();
 
     if (capture_state == STATE_HOPPING) {
-        if (digitalRead(CC1101_GDO0) == HIGH) {
+        // CORREÇÃO: usa contagem de transições da ISR em vez de digitalRead(GDO0).
+        // digitalRead(GDO0) só pega o nível atual — mas GDO0 com OOK oscila rapidamente.
+        // Se a ISR capturou mais de 5 transições, há sinal real sendo recebido.
+        // O ruído de fundo gera ~1-2 transições por segundo; um controle gera centenas.
+        if (isr_count > 5) {
             capture_state = STATE_LOCKED;
         } 
-        else if (nowMs - lastFreqSwitch > 400) {
+        else if (nowMs - lastFreqSwitch > 1000) {
+            // Sem sinal, troca de frequência e zera contador
+            isr_enabled = false;
+            isr_count = 0;
+            capture_started = false;
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             cc1101SetFrequency(currentCapture.frequency);
             cc1101SendCommand(CC1101_SIDLE); delay(1);
             cc1101SendCommand(CC1101_SRX); delay(5);
+            isr_last_val = digitalRead(CC1101_GDO0);
+            isr_last_change = micros();
+            isr_enabled = true;
             lastFreqSwitch = nowMs;
         }
     } 
     else if (capture_state == STATE_LOCKED) {
-        // CORREÇÃO: Troca IOCFG0 de 0x0E (Carrier Sense) para 0x0D (async data).
-        // Agora que sabemos que há sinal (CS detectou), precisamos do dado demodulado
-        // para capturar os timings das transições.
-        cc1101WriteReg(CC1101_IOCFG0, 0x0D);
+        // IOCFG0 já está em 0x0D desde StartCapture (não precisa reescrever)
         delay(2); 
         isr_count = 0;
         isr_last_val = digitalRead(CC1101_GDO0);
@@ -254,8 +259,7 @@ void cc1101CaptureLoop() {
 
         if (noiseTimeout) {
             isr_enabled = false; 
-            // Volta para Carrier Sense para detectar próximo sinal
-            cc1101WriteReg(CC1101_IOCFG0, 0x0E);
+            // Mantém 0x0D (não volta para 0x06 que não detecta OOK)
             isr_count = 0;
             capture_started = false;
             capture_state = STATE_HOPPING;
@@ -263,8 +267,6 @@ void cc1101CaptureLoop() {
         }
         else if ((capture_started && silenceTimeout) || bufferFull) {
             isr_enabled = false; 
-            // Volta para Carrier Sense após captura
-            cc1101WriteReg(CC1101_IOCFG0, 0x0E);
             currentCapture.active = false;
             cc1101CopyActive = false;
             cc1101SendCommand(CC1101_SIDLE);
@@ -289,8 +291,7 @@ void cc1101CaptureLoop() {
         } 
         else if (totalTimeout) {
             isr_enabled = false;
-            // Volta para Carrier Sense
-            cc1101WriteReg(CC1101_IOCFG0, 0x0E);
+            // Mantém 0x0D
             currentCapture.count = 0;
             currentCapture.startTime = millis();
             captureStartTime = millis(); 
@@ -309,8 +310,7 @@ void cc1101CaptureLoop() {
 
 void cc1101StopCapture() {
     isr_enabled = false; 
-    // Volta para Carrier Sense
-    cc1101WriteReg(CC1101_IOCFG0, 0x0E); 
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
     cc1101CopyActive = false;
     currentCapture.active = false;
     cc1101SendCommand(CC1101_SIDLE);
@@ -498,26 +498,17 @@ void cc1101AnalyzerLoop() {
 
     uint32_t freq = spec_an_freqs[spec_an_idx];
     cc1101SetFrequency(freq);
-    // MCSM0=0x18 calibra automaticamente no SIDLE->SRX
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX);
-    // CORREÇÃO: 2ms de settle time (era 300μs).
-    // O AGC precisa de ~1ms para estabilizar após mudar de frequência.
-    // 300μs é muito pouco — lê ruído de transição em vez de sinal real.
-    delay(2);
+    delayMicroseconds(300); 
 
     uint8_t rssiDec = cc1101ReadStatus(CC1101_RSSI);
     int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
     
-    // CORREÇÃO: range mais amplo e threshold para filtrar ruído
-    // Ruído de fundo: -100 a -85 dBm
-    // Sinal real de controle: -70 a -30 dBm
     if (rssi < -90) rssi = -90;
-    if (rssi > -30) rssi = -30;
+    if (rssi > -50) rssi = -50;
     
-    uint16_t target_h = map(rssi, -90, -30, 0, 40);
-    // CORREÇÃO: só mostra barra se RSSI > -80dBm (filtra ruído fantasma)
-    if (rssi < -80) target_h = 0;
+    uint16_t target_h = map(rssi, -90, -50, 0, 40);
     if (target_h > spec_an_values[spec_an_idx]) {
         spec_an_values[spec_an_idx] = target_h;
     }
