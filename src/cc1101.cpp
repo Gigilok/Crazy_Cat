@@ -104,11 +104,7 @@ void IRAM_ATTR cc1101ISR() {
 void cc1101Select() { 
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     digitalWrite(CC1101_CSN, LOW); 
-    // CORREÇÃO CRÍTICA: espera MISO ficar LOW (chip ready)
-    // Sem isso, comandos são enviados mas IGNORADOS pelo chip
-    // (confirmado comparando com biblioteca ELECHOUSE que funciona)
-    uint32_t timeout = millis();
-    while (digitalRead(CC1101_MISO) && (millis() - timeout < 100));
+    delayMicroseconds(50);  // Tempo para o chip responder (estilo ELECHOUSE)
 }
 void cc1101Deselect() { digitalWrite(CC1101_CSN, HIGH); spiCC1101.endTransaction(); }
 
@@ -142,17 +138,19 @@ bool cc1101Init() {
     pinMode(CC1101_CSN, OUTPUT); digitalWrite(CC1101_CSN, HIGH);
     pinMode(CC1101_GDO0, INPUT); pinMode(CC1101_GDO2, INPUT);
 
-    digitalWrite(CC1101_CSN, LOW); delayMicroseconds(10);
-    digitalWrite(CC1101_CSN, HIGH); delay(100);
+    // Reset estilo ELECHOUSE: pulso CSN + espera
+    digitalWrite(CC1101_CSN, LOW); delay(1);
+    digitalWrite(CC1101_CSN, HIGH); delay(1);
+    digitalWrite(CC1101_CSN, LOW); delay(1);
+    digitalWrite(CC1101_CSN, HIGH); delay(10);
+
+    // Envia SRES (reset) e espera o chip reiniciar
+    cc1101SendCommand(CC1101_SRES); 
+    delay(150);  // Datasheet: SRES demora ~120us, mas clones precisam de mais
 
     uint8_t partnum = 0xFF;
-    for (int i = 0; i < 3; i++) {
-        cc1101SendCommand(CC1101_SRES); delay(10);
+    for (int i = 0; i < 5; i++) {  // 5 tentativas em vez de 3
         partnum = cc1101ReadStatus(CC1101_PARTNUM);
-        // CORREÇÃO CRÍTICA: PARTNUM=0x00 é o valor CORRETO do CC1101!
-        // O datasheet diz que CC1101 retorna 0x00 no registrador PARTNUM.
-        // Antes o código rejeitava 0x00 achando que era falha, mas é sucesso.
-        // Só 0xFF significa que o módulo não responde.
         if (partnum != 0xFF) break;
         delay(50);
     }
