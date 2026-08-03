@@ -252,9 +252,17 @@ void cc1101StartCapture() {
     cc1101WriteReg(CC1101_IOCFG0, 0x0D);
     pinMode(CC1101_GDO0, INPUT); 
     cc1101SetFrequency(currentCapture.frequency);
-    cc1101SendCommand(CC1101_SIDLE); delay(1);
-    cc1101SendCommand(CC1101_SCAL); delay(1);
-    cc1101SendCommand(CC1101_SRX); delay(10);
+    // CORREÇÃO: Sequência exata do datasheet TI para entrar em RX:
+    // 1. SIDLE para garantir que está parado
+    // 2. SCAL para calibrar VCO (sem isso o SRX falha em alguns clones)
+    // 3. SRX para entrar em RX
+    // delay maior (5ms) porque o SCAL demora ~720us e o SRX precisa estabilizar
+    cc1101SendCommand(CC1101_SIDLE); 
+    delay(2);  // tempo para o chip sair de qualquer estado
+    cc1101SendCommand(CC1101_SCAL); 
+    delay(2);  // tempo para calibrar (~720us)
+    cc1101SendCommand(CC1101_SRX); 
+    delay(5);  // tempo para entrar em RX
     
     // === DIAGNÓSTICO: verifica se entrou em RX ===
     uint8_t marc = cc1101ReadStatus(0x35) & 0x1F;
@@ -294,8 +302,8 @@ void cc1101CaptureLoop() {
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             cc1101SetFrequency(currentCapture.frequency);
-            cc1101SendCommand(CC1101_SIDLE); delay(1);
-            cc1101SendCommand(CC1101_SCAL); delay(1);
+            cc1101SendCommand(CC1101_SIDLE); delay(2);
+            cc1101SendCommand(CC1101_SCAL); delay(2);
             cc1101SendCommand(CC1101_SRX); delay(5);
             isr_last_val = digitalRead(CC1101_GDO0);
             isr_last_change = micros();
@@ -364,8 +372,8 @@ void cc1101CaptureLoop() {
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             lastFreqSwitch = millis();
             cc1101SetFrequency(currentCapture.frequency);
-            cc1101SendCommand(CC1101_SIDLE); delay(1);
-            cc1101SendCommand(CC1101_SCAL); delay(1);
+            cc1101SendCommand(CC1101_SIDLE); delay(2);
+            cc1101SendCommand(CC1101_SCAL); delay(2);
             cc1101SendCommand(CC1101_SRX); delay(5);
         }
     }
