@@ -145,10 +145,14 @@ bool cc1101Init() {
     for (int i = 0; i < 3; i++) {
         cc1101SendCommand(CC1101_SRES); delay(10);
         partnum = cc1101ReadStatus(CC1101_PARTNUM);
-        if (partnum != 0x00 && partnum != 0xFF) break;
+        // CORREÇÃO CRÍTICA: PARTNUM=0x00 é o valor CORRETO do CC1101!
+        // O datasheet diz que CC1101 retorna 0x00 no registrador PARTNUM.
+        // Antes o código rejeitava 0x00 achando que era falha, mas é sucesso.
+        // Só 0xFF significa que o módulo não responde.
+        if (partnum != 0xFF) break;
         delay(50);
     }
-    if (partnum == 0x00 || partnum == 0xFF) return false;
+    if (partnum == 0xFF) return false;  // só rejeita 0xFF (sem resposta)
 
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
 
