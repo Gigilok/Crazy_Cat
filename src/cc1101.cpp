@@ -227,6 +227,7 @@ void cc1101StartCapture() {
     pinMode(CC1101_GDO0, INPUT); 
     cc1101SetFrequency(currentCapture.frequency);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
+    cc1101SendCommand(CC1101_SCAL); delay(1);
     cc1101SendCommand(CC1101_SRX); delay(10);
     
     // === DIAGNÓSTICO: verifica se entrou em RX ===
@@ -268,6 +269,7 @@ void cc1101CaptureLoop() {
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             cc1101SetFrequency(currentCapture.frequency);
             cc1101SendCommand(CC1101_SIDLE); delay(1);
+            cc1101SendCommand(CC1101_SCAL); delay(1);
             cc1101SendCommand(CC1101_SRX); delay(5);
             isr_last_val = digitalRead(CC1101_GDO0);
             isr_last_change = micros();
@@ -337,6 +339,7 @@ void cc1101CaptureLoop() {
             lastFreqSwitch = millis();
             cc1101SetFrequency(currentCapture.frequency);
             cc1101SendCommand(CC1101_SIDLE); delay(1);
+            cc1101SendCommand(CC1101_SCAL); delay(1);
             cc1101SendCommand(CC1101_SRX); delay(5);
         }
     }
