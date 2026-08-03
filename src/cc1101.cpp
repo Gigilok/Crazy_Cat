@@ -159,7 +159,7 @@ bool cc1101Init() {
     cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
     cc1101WriteReg(CC1101_FIFOTHR, 0x47);
     cc1101WriteReg(CC1101_PKTCTRL0, 0x32); 
-    cc1101WriteReg(CC1101_MDMCFG4, 0xF7); 
+    cc1101WriteReg(CC1101_MDMCFG4, 0x17); 
     cc1101WriteReg(CC1101_MDMCFG3, 0x83); 
     cc1101WriteReg(CC1101_MDMCFG2, 0x30); 
     cc1101WriteReg(CC1101_MDMCFG1, 0x22);
