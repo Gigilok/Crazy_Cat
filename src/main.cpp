@@ -27,6 +27,10 @@ bool cc1101OK = false;
 bool displayOK = false;
 
 void setup() {
+    // PROTEÇÃO CRÍTICA: GPIO15 (CC1101_CSN) é strapping pin.
+    // Configurar como OUTPUT HIGH ANTES de qualquer coisa para garantir boot estável.
+    pinMode(15, OUTPUT); digitalWrite(15, HIGH);
+    
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
