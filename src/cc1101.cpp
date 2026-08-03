@@ -101,29 +101,33 @@ void IRAM_ATTR cc1101ISR() {
     }
 }
 
-void cc1101Select() { digitalWrite(CC1101_CSN, LOW); delayMicroseconds(10); }
-void cc1101Deselect() { digitalWrite(CC1101_CSN, HIGH); }
+void cc1101Select() { 
+    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    digitalWrite(CC1101_CSN, LOW); 
+    // CORREÇÃO CRÍTICA: espera MISO ficar LOW (chip ready)
+    // Sem isso, comandos são enviados mas IGNORADOS pelo chip
+    // (confirmado comparando com biblioteca ELECHOUSE que funciona)
+    uint32_t timeout = millis();
+    while (digitalRead(CC1101_MISO) && (millis() - timeout < 100));
+}
+void cc1101Deselect() { digitalWrite(CC1101_CSN, HIGH); spiCC1101.endTransaction(); }
 
 uint8_t cc1101ReadReg(uint8_t reg) {
-    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     cc1101Select(); spiCC1101.transfer(reg | CC1101_READ_SINGLE);
-    uint8_t val = spiCC1101.transfer(0x00); cc1101Deselect(); spiCC1101.endTransaction();
+    uint8_t val = spiCC1101.transfer(0x00); cc1101Deselect();
     return val;
 }
 uint8_t cc1101ReadStatus(uint8_t reg) {
-    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     cc1101Select(); spiCC1101.transfer(reg | CC1101_READ_BURST);
-    uint8_t val = spiCC1101.transfer(0x00); cc1101Deselect(); spiCC1101.endTransaction();
+    uint8_t val = spiCC1101.transfer(0x00); cc1101Deselect();
     return val;
 }
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
-    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     cc1101Select(); spiCC1101.transfer(reg); spiCC1101.transfer(value);
-    cc1101Deselect(); spiCC1101.endTransaction();
+    cc1101Deselect();
 }
 void cc1101SendCommand(uint8_t cmd) {
-    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    cc1101Select(); spiCC1101.transfer(cmd); cc1101Deselect(); spiCC1101.endTransaction();
+    cc1101Select(); spiCC1101.transfer(cmd); cc1101Deselect();
 }
 void cc1101SetFrequency(uint32_t freqHz) {
     uint32_t freqWord = (uint32_t)((freqHz / 26000000.0) * 65536);
@@ -179,10 +183,9 @@ bool cc1101Init() {
     cc1101WriteReg(CC1101_TEST1, 0x35);
     cc1101WriteReg(CC1101_TEST0, 0x09);
 
-    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     cc1101Select(); spiCC1101.transfer(CC1101_PATABLE | CC1101_WRITE_BURST);
     for (int i = 0; i < 8; i++) spiCC1101.transfer(0xC0); 
-    cc1101Deselect(); spiCC1101.endTransaction();
+    cc1101Deselect();
 
     cc1101Initialized = true;
     Serial.println("[CC1101] Configurado com sucesso!");
@@ -196,14 +199,12 @@ bool cc1101Init() {
     uint8_t status1 = spiCC1101.transfer(0x30 | 0xC0);  // READ_BURST PARTNUM
     uint8_t partnum_val = spiCC1101.transfer(0x00);
     cc1101Deselect();
-    spiCC1101.endTransaction();
     
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     cc1101Select();
     uint8_t status2 = spiCC1101.transfer(0x31 | 0xC0);  // READ_BURST VERSION
     uint8_t version_val = spiCC1101.transfer(0x00);
     cc1101Deselect();
-    spiCC1101.endTransaction();
     
     Serial.printf("  STATUS BYTE (PARTNUM) = 0x%02X (bit7=CHIP_RDYn, 0=pronto)\n", status1);
     Serial.printf("  STATUS BYTE (VERSION) = 0x%02X\n", status2);
