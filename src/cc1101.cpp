@@ -186,6 +186,25 @@ bool cc1101Init() {
 
     cc1101Initialized = true;
     Serial.println("[CC1101] Configurado com sucesso!");
+    
+    // === DIAGNÓSTICO: lê de volta os registradores críticos ===
+    Serial.println("[CC1101] === DIAGNÓSTICO DE REGISTRADORES ===");
+    Serial.printf("  IOCFG0    = 0x%02X (esperado 0x0D)\n", cc1101ReadReg(0x02));
+    Serial.printf("  PKTCTRL0  = 0x%02X (esperado 0x32)\n", cc1101ReadReg(0x08));
+    Serial.printf("  MDMCFG4   = 0x%02X (esperado 0x17)\n", cc1101ReadReg(0x10));
+    Serial.printf("  MDMCFG2   = 0x%02X (esperado 0x30)\n", cc1101ReadReg(0x12));
+    Serial.printf("  MDMCFG1   = 0x%02X (esperado 0x00)\n", cc1101ReadReg(0x13));
+    Serial.printf("  AGCCTRL2  = 0x%02X (esperado 0x07)\n", cc1101ReadReg(0x1B));
+    Serial.printf("  FREQ2     = 0x%02X\n", cc1101ReadReg(0x0D));
+    Serial.printf("  FREQ1     = 0x%02X\n", cc1101ReadReg(0x0E));
+    Serial.printf("  FREQ0     = 0x%02X\n", cc1101ReadReg(0x0F));
+    Serial.printf("  PARTNUM   = 0x%02X\n", cc1101ReadStatus(0x30));
+    Serial.printf("  VERSION   = 0x%02X\n", cc1101ReadStatus(0x31));
+    Serial.printf("  MARCSTATE = 0x%02X (0x0D=RX, 0x01=IDLE)\n", cc1101ReadStatus(0x35) & 0x1F);
+    Serial.printf("  GDO0 pin  = %d\n", digitalRead(CC1101_GDO0));
+    Serial.println("[CC1101] === FIM DO DIAGNÓSTICO ===");
+    Serial.flush();
+    
     return true;
 }
 
@@ -209,6 +228,18 @@ void cc1101StartCapture() {
     cc1101SetFrequency(currentCapture.frequency);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX); delay(10);
+    
+    // === DIAGNÓSTICO: verifica se entrou em RX ===
+    uint8_t marc = cc1101ReadStatus(0x35) & 0x1F;
+    uint8_t rssiDec = cc1101ReadStatus(0x34);
+    int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
+    Serial.printf("[CC1101] Capture iniciada:\n");
+    Serial.printf("  Freq    = %lu Hz\n", currentCapture.frequency);
+    Serial.printf("  MARCSTATE = 0x%02X (0x0D=RX)\n", marc);
+    Serial.printf("  RSSI    = %d dBm\n", rssi);
+    Serial.printf("  GDO0    = %d\n", digitalRead(CC1101_GDO0));
+    Serial.flush();
+    
     // Habilita ISR desde o início — ela só conta transições, não causa bootloop
     isr_last_val = digitalRead(CC1101_GDO0);
     isr_last_change = micros();
