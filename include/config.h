@@ -9,7 +9,7 @@
 #define OLED_SCK    22
 #define OLED_SDA    21
 
-#define BTN_UP      16
+#define BTN_UP      5
 #define BTN_DOWN    15
 #define BTN_SELECT  32
 #define BTN_BACK    33
@@ -20,7 +20,7 @@
 #define NRF_MOSI    23
 #define NRF_MISO    19
 
-#define CC1101_GDO0  5
+#define CC1101_GDO0 16
 #define CC1101_CSN  27
 #define CC1101_SCK  14
 #define CC1101_MOSI 13
