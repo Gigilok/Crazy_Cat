@@ -157,19 +157,18 @@ bool cc1101Init() {
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
 
     cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
-    cc1101WriteReg(CC1101_FIFOTHR, 0x47);
+    cc1101WriteReg(CC1101_FIFOTHR, 0x07);
     cc1101WriteReg(CC1101_PKTCTRL0, 0x32); 
     cc1101WriteReg(CC1101_MDMCFG4, 0x17); 
-    cc1101WriteReg(CC1101_MDMCFG3, 0x83); 
+    cc1101WriteReg(CC1101_MDMCFG3, 0x32); 
     cc1101WriteReg(CC1101_MDMCFG2, 0x30); 
-    cc1101WriteReg(CC1101_MDMCFG1, 0x22);
-    cc1101WriteReg(CC1101_MDMCFG0, 0xF8);
+    cc1101WriteReg(CC1101_MDMCFG1, 0x00);
+    cc1101WriteReg(CC1101_MDMCFG0, 0x00);
     cc1101WriteReg(CC1101_DEVIATN, 0x15);
     cc1101WriteReg(CC1101_MCSM0, 0x18);
-    cc1101WriteReg(CC1101_FOCCFG, 0x16);
-    cc1101WriteReg(CC1101_BSCFG, 0x6C);
-    cc1101WriteReg(CC1101_AGCCTRL2, 0x43);
-    cc1101WriteReg(CC1101_AGCCTRL1, 0x40);
+    cc1101WriteReg(CC1101_FOCCFG, 0x18);
+    cc1101WriteReg(CC1101_AGCCTRL2, 0x07);
+    cc1101WriteReg(CC1101_AGCCTRL1, 0x00);
     cc1101WriteReg(CC1101_AGCCTRL0, 0x91);
     cc1101WriteReg(CC1101_FREND0, 0x11);
     cc1101WriteReg(CC1101_FSCAL3, 0xE9);
