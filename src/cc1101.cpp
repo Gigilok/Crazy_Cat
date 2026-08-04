@@ -133,9 +133,7 @@ void cc1101SendCommand(uint8_t cmd) {
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     digitalWrite(CC1101_CSN, LOW);
     // Espera MISO ficar LOW (chip ready) com limite de 50 iterações (5ms max).
-    // Isto é SEGURO: só roda DEPOIS de spiCC1101.begin() no cc1101Init().
-    // Sem isso, strobes (SIDLE/SRX/SCAL) são IGNORADOS pelo CC1101.
-    // Confirmado por diagnóstico: MARCSTATE=0x01 (IDLE) sem esta espera.
+    // Estilo Flipper Zero e ELECHOUSE — sem isso, strobes são IGNORADOS.
     for (uint8_t i = 0; i < 50 && digitalRead(CC1101_MISO); i++) {
         delayMicroseconds(100);
     }
@@ -143,6 +141,25 @@ void cc1101SendCommand(uint8_t cmd) {
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
     delayMicroseconds(100);
+}
+
+// Função auxiliar: entra em RX com retry (estilo Flipper cc1101_wait_status_state)
+static void cc1101EnterRX() {
+    for (int retry = 0; retry < 5; retry++) {
+        cc1101SendCommand(CC1101_SIDLE);
+        delay(2);
+        cc1101SendCommand(CC1101_SRX);
+        delay(5);
+        // Verifica se entrou em RX (MARCSTATE = 0x0D)
+        uint8_t state = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
+        if (state == 0x0D) {
+            Serial.printf("[CC1101] RX ativado (retry %d)\n", retry);
+            return;
+        }
+        Serial.printf("[CC1101] SRX falhou, MARCSTATE=0x%02X, retry %d\n", state, retry);
+        delay(10);
+    }
+    Serial.println("[CC1101] AVISO: não entrou em RX após 5 tentativas");
 }
 void cc1101SetFrequency(uint32_t freqHz) {
     uint32_t freqWord = (uint32_t)((freqHz / 26000000.0) * 65536);
@@ -161,17 +178,17 @@ bool cc1101Init() {
     digitalWrite(CC1101_CSN, HIGH); delay(100);
 
     uint8_t partnum = 0xFF;
-    for (int i = 0; i < 3; i++) {
-        cc1101SendCommand(CC1101_SRES); delay(10);
+    // Reset + espera (estilo ELECHOUSE: SRES uma vez, delay grande)
+    cc1101SendCommand(CC1101_SRES);
+    delay(200);  // Clones precisam de mais tempo após SRES
+    
+    // Tenta ler PARTNUM várias vezes (chip pode demorar a responder após reset)
+    for (int i = 0; i < 5; i++) {
         partnum = cc1101ReadStatus(CC1101_PARTNUM);
-        // CORREÇÃO CRÍTICA: PARTNUM=0x00 é o valor CORRETO do CC1101!
-        // O datasheet diz que CC1101 retorna 0x00 no registrador PARTNUM.
-        // Antes o código rejeitava 0x00 achando que era falha, mas é sucesso.
-        // Só 0xFF significa que o módulo não responde.
         if (partnum != 0xFF) break;
         delay(50);
     }
-    if (partnum == 0xFF) return false;  // só rejeita 0xFF (sem resposta)
+    if (partnum == 0xFF) return false;
 
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
 
@@ -275,13 +292,8 @@ void cc1101StartCapture() {
     // 1. SIDLE para garantir que está parado
     // 2. SCAL para calibrar VCO (sem isso o SRX falha em alguns clones)
     // 3. SRX para entrar em RX
-    // delay maior (5ms) porque o SCAL demora ~720us e o SRX precisa estabilizar
-    cc1101SendCommand(CC1101_SIDLE); 
-    delay(2);  // tempo para o chip sair de qualquer estado
-    cc1101SendCommand(CC1101_SCAL); 
-    delay(2);  // tempo para calibrar (~720us)
-    cc1101SendCommand(CC1101_SRX); 
-    delay(5);  // tempo para entrar em RX
+    // CORREÇÃO: usa cc1101EnterRX() com retry (estilo Flipper)
+    cc1101EnterRX();
     
     // === DIAGNÓSTICO: verifica se entrou em RX ===
     uint8_t marc = cc1101ReadStatus(0x35) & 0x1F;
@@ -321,9 +333,7 @@ void cc1101CaptureLoop() {
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             cc1101SetFrequency(currentCapture.frequency);
-            cc1101SendCommand(CC1101_SIDLE); delay(2);
-            cc1101SendCommand(CC1101_SCAL); delay(2);
-            cc1101SendCommand(CC1101_SRX); delay(5);
+            cc1101EnterRX();
             isr_last_val = digitalRead(CC1101_GDO0);
             isr_last_change = micros();
             isr_enabled = true;
