@@ -245,7 +245,7 @@ bool cc1101Init() {
     cc1101WriteReg(0x02, 0xAB);  // escreve 0xAB no IOCFG0
     uint8_t readback = cc1101ReadReg(0x02);  // lê de volta
     Serial.printf("  WRITE-READBACK: escreveu 0xAB no IOCFG0, leu 0x%02X\n", readback);
-    cc1101WriteReg(0x02, 0x0D);  // restaura valor correto
+    cc1101WriteReg(0x02, 0x06);  // restaura valor correto (RX FIFO mode)
     
     // Teste 3: ler registradores de configuração
     Serial.printf("  IOCFG0    = 0x%02X (esperado 0x0D)\n", cc1101ReadReg(0x02));
