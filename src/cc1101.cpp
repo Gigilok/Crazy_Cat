@@ -106,20 +106,28 @@ void cc1101Deselect() { digitalWrite(CC1101_CSN, HIGH); }
 
 uint8_t cc1101ReadReg(uint8_t reg) {
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    cc1101Select(); spiCC1101.transfer(reg | CC1101_READ_SINGLE);
-    uint8_t val = spiCC1101.transfer(0x00); cc1101Deselect(); spiCC1101.endTransaction();
+    digitalWrite(CC1101_CSN, LOW);
+    for (uint8_t i = 0; i < 50 && digitalRead(CC1101_MISO); i++) delayMicroseconds(100);
+    spiCC1101.transfer(reg | CC1101_READ_SINGLE);
+    uint8_t val = spiCC1101.transfer(0x00); 
+    digitalWrite(CC1101_CSN, HIGH); spiCC1101.endTransaction();
     return val;
 }
 uint8_t cc1101ReadStatus(uint8_t reg) {
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    cc1101Select(); spiCC1101.transfer(reg | CC1101_READ_BURST);
-    uint8_t val = spiCC1101.transfer(0x00); cc1101Deselect(); spiCC1101.endTransaction();
+    digitalWrite(CC1101_CSN, LOW);
+    for (uint8_t i = 0; i < 50 && digitalRead(CC1101_MISO); i++) delayMicroseconds(100);
+    spiCC1101.transfer(reg | CC1101_READ_BURST);
+    uint8_t val = spiCC1101.transfer(0x00); 
+    digitalWrite(CC1101_CSN, HIGH); spiCC1101.endTransaction();
     return val;
 }
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    cc1101Select(); spiCC1101.transfer(reg); spiCC1101.transfer(value);
-    cc1101Deselect(); spiCC1101.endTransaction();
+    digitalWrite(CC1101_CSN, LOW);
+    for (uint8_t i = 0; i < 50 && digitalRead(CC1101_MISO); i++) delayMicroseconds(100);
+    spiCC1101.transfer(reg); spiCC1101.transfer(value);
+    digitalWrite(CC1101_CSN, HIGH); spiCC1101.endTransaction();
 }
 void cc1101SendCommand(uint8_t cmd) {
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
