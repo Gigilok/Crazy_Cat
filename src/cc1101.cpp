@@ -143,23 +143,14 @@ void cc1101SendCommand(uint8_t cmd) {
     delayMicroseconds(100);
 }
 
-// Função auxiliar: entra em RX com retry (estilo Flipper cc1101_wait_status_state)
+// Função auxiliar: entra em RX sem verificação (estilo ELECHOUSE)
+// Clones do CC1101 (VERSION=0x14) têm bug onde MARCSTATE retorna 0x00
+// após SRX. A ELECHOUSE library não verifica — apenas envia os strobes.
 static void cc1101EnterRX() {
-    for (int retry = 0; retry < 5; retry++) {
-        cc1101SendCommand(CC1101_SIDLE);
-        delay(2);
-        cc1101SendCommand(CC1101_SRX);
-        delay(5);
-        // Verifica se entrou em RX (MARCSTATE = 0x0D)
-        uint8_t state = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
-        if (state == 0x0D) {
-            Serial.printf("[CC1101] RX ativado (retry %d)\n", retry);
-            return;
-        }
-        Serial.printf("[CC1101] SRX falhou, MARCSTATE=0x%02X, retry %d\n", state, retry);
-        delay(10);
-    }
-    Serial.println("[CC1101] AVISO: não entrou em RX após 5 tentativas");
+    cc1101SendCommand(CC1101_SIDLE);
+    delay(2);
+    cc1101SendCommand(CC1101_SRX);
+    delay(10);
 }
 void cc1101SetFrequency(uint32_t freqHz) {
     uint32_t freqWord = (uint32_t)((freqHz / 26000000.0) * 65536);
@@ -292,19 +283,9 @@ void cc1101StartCapture() {
     // 1. SIDLE para garantir que está parado
     // 2. SCAL para calibrar VCO (sem isso o SRX falha em alguns clones)
     // 3. SRX para entrar em RX
-    // CORREÇÃO: usa cc1101EnterRX() com retry (estilo Flipper)
+    // CORREÇÃO: usa cc1101EnterRX() (estilo ELECHOUSE - sem verificação)
+    // Clones do CC1101 retornam 0x00 no MARCSTATE após SRX (bug conhecido)
     cc1101EnterRX();
-    
-    // === DIAGNÓSTICO: verifica se entrou em RX ===
-    uint8_t marc = cc1101ReadStatus(0x35) & 0x1F;
-    uint8_t rssiDec = cc1101ReadStatus(0x34);
-    int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
-    Serial.printf("[CC1101] Capture iniciada:\n");
-    Serial.printf("  Freq    = %lu Hz\n", currentCapture.frequency);
-    Serial.printf("  MARCSTATE = 0x%02X (0x0D=RX)\n", marc);
-    Serial.printf("  RSSI    = %d dBm\n", rssi);
-    Serial.printf("  GDO0    = %d\n", digitalRead(CC1101_GDO0));
-    Serial.flush();
     
     // Habilita ISR desde o início — ela só conta transições, não causa bootloop
     isr_last_val = digitalRead(CC1101_GDO0);
