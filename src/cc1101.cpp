@@ -109,11 +109,20 @@ bool cc1101Init() {
     ELECHOUSE_cc1101.setSyncMode(0);       // No preamble/sync
     ELECHOUSE_cc1101.setMHZ(433.92);       // 433.92 MHz
     
+    // CORREÇÃO CRÍTICA: Mudar IOCFG0 para 0x0D (async serial data).
+    // O Init() da ELECHOUSE configura IOCFG0=0x06 (FIFO) por padrão.
+    // Mas 0x06 NÃO oscila o GDO0 com dados OOK — só sinaliza FIFO cheio.
+    // Para captura RAW de timings, precisamos do dado demodulado direto no GDO0.
+    // 0x0D = GDO0 output = async serial data (copia o sinal OOK demodulado).
+    ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x0D);  // IOCFG0 = 0x0D
+    
     // Entra em RX
     ELECHOUSE_cc1101.SetRx();
     
-    // Configura ISR no GDO0
-    pinMode(CC1101_GDO0, INPUT);
+    // CORREÇÃO: INPUT_PULLUP no GDO0 para evitar flutuação.
+    // GPIO16 não é strapping pin, INPUT_PULLUP é seguro.
+    // Sem pull, o pino flutua e capta ruído do ambiente (dedo faz ler).
+    pinMode(CC1101_GDO0, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
     
     cc1101Initialized = true;
@@ -140,6 +149,8 @@ void cc1101StartCapture() {
     
     // Configura frequência e entra em RX (estilo ELECHOUSE)
     ELECHOUSE_cc1101.setMHZ(currentCapture.frequency / 1000000.0);
+    // Garante IOCFG0=0x0D (async serial) para captura RAW
+    ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x0D);
     ELECHOUSE_cc1101.SetRx();
     delay(10);
     
@@ -165,6 +176,7 @@ void cc1101CaptureLoop() {
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             ELECHOUSE_cc1101.setMHZ(currentCapture.frequency / 1000000.0);
+            ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x0D); // IOCFG0 = async serial
             ELECHOUSE_cc1101.SetRx();
             delay(5);
             isr_last_val = digitalRead(CC1101_GDO0);
@@ -232,6 +244,7 @@ void cc1101CaptureLoop() {
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             lastFreqSwitch = millis();
             ELECHOUSE_cc1101.setMHZ(currentCapture.frequency / 1000000.0);
+            ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x0D); // IOCFG0 = async serial
             ELECHOUSE_cc1101.SetRx();
             delay(5);
         }
@@ -264,7 +277,7 @@ void cc1101ReplaySignal(uint8_t index) {
         delayMicroseconds(sig->timings[i]);
     }
     digitalWrite(CC1101_GDO0, LOW);
-    pinMode(CC1101_GDO0, INPUT);
+    pinMode(CC1101_GDO0, INPUT_PULLUP);
     ELECHOUSE_cc1101.SetRx();
 }
 
@@ -295,7 +308,7 @@ void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
         digitalWrite(CC1101_GDO0, LOW); delayMicroseconds(9300); 
     }
     digitalWrite(CC1101_GDO0, LOW);
-    pinMode(CC1101_GDO0, INPUT);
+    pinMode(CC1101_GDO0, INPUT_PULLUP);
     ELECHOUSE_cc1101.SetRx();
 }
 
@@ -313,7 +326,7 @@ void cc1101StartSubGHzJammer() {
 void cc1101StopSubGHzJammer() {
     if (!cc1101Initialized) return;
     digitalWrite(CC1101_GDO0, LOW);
-    pinMode(CC1101_GDO0, INPUT);
+    pinMode(CC1101_GDO0, INPUT_PULLUP);
     ELECHOUSE_cc1101.SetRx();
 }
 
@@ -326,7 +339,7 @@ void cc1101StartRollJam() {
     currentCapture.frequency = 433920000; 
     isr_enabled = false;
     ELECHOUSE_cc1101.setMHZ(433.92);
-    pinMode(CC1101_GDO0, INPUT);
+    pinMode(CC1101_GDO0, INPUT_PULLUP);
     ELECHOUSE_cc1101.SetRx();
     delay(5);
 }
@@ -360,7 +373,7 @@ void cc1101RollJamLoop() {
     else if (rj_state == 2) {
         if (now - rj_timer > 200) {
             digitalWrite(CC1101_GDO0, LOW);
-            pinMode(CC1101_GDO0, INPUT);
+            pinMode(CC1101_GDO0, INPUT_PULLUP);
             ELECHOUSE_cc1101.SetRx();
             
             if (isr_count > 20 && savedSignalCount < MAX_SAVED_SIGNALS) {
@@ -382,7 +395,7 @@ void cc1101StopRollJam() {
     cc1101RollJamActive = false;
     isr_enabled = false;
     digitalWrite(CC1101_GDO0, LOW);
-    pinMode(CC1101_GDO0, INPUT);
+    pinMode(CC1101_GDO0, INPUT_PULLUP);
     ELECHOUSE_cc1101.SetRx();
 }
 
@@ -461,7 +474,7 @@ void cc1101TransmitRaw(uint32_t frequency, uint16_t* timings, uint8_t length) {
         delayMicroseconds(timings[i]);
     }
     digitalWrite(CC1101_GDO0, LOW);
-    pinMode(CC1101_GDO0, INPUT);
+    pinMode(CC1101_GDO0, INPUT_PULLUP);
     ELECHOUSE_cc1101.SetRx();
 }
 
