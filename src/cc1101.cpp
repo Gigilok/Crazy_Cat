@@ -91,13 +91,20 @@ void IRAM_ATTR cc1101ISR() {
     unsigned long now = micros();
     uint8_t val = digitalRead(CC1101_GDO0);
     if (val != isr_last_val) {
-        if (isr_count < 200) {
-            isr_timings[isr_count] = now - isr_last_change;
-            isr_count++;
+        unsigned long duration = now - isr_last_change;
+        // FILTRO DE TIMING (igual HIZMOS e rc-switch):
+        // - Rejeita pulsos < 100us (ruído elétrico/spike)
+        // - Rejeita pulsos > 100000us (silêncio/fim de transmissão)
+        // Controles remotos têm pulsos entre 200us e 15000us
+        if (duration > 100 && duration < 100000) {
+            if (isr_count < 200) {
+                isr_timings[isr_count] = duration;
+                isr_count++;
+            }
+            capture_started = true;
         }
         isr_last_val = val;
         isr_last_change = now;
-        capture_started = true;
     }
 }
 
