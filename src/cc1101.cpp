@@ -161,13 +161,19 @@ bool cc1101Init() {
     pinMode(CC1101_CSN, OUTPUT); digitalWrite(CC1101_CSN, HIGH);
     pinMode(CC1101_GDO0, INPUT); pinMode(CC1101_GDO2, INPUT);
 
-    digitalWrite(CC1101_CSN, LOW); delayMicroseconds(10);
-    digitalWrite(CC1101_CSN, HIGH); delay(100);
+    // Reset estilo ELECHOUSE: pulso CSN + while(MISO) + SRES + while(MISO)
+    digitalWrite(CC1101_CSN, LOW); delay(1);
+    digitalWrite(CC1101_CSN, HIGH); delay(1);
+    digitalWrite(CC1101_CSN, LOW);
+    while (digitalRead(CC1101_MISO));
+    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    spiCC1101.transfer(CC1101_SRES);
+    while (digitalRead(CC1101_MISO));
+    digitalWrite(CC1101_CSN, HIGH);
+    spiCC1101.endTransaction();
+    delay(150);
 
     uint8_t partnum = 0xFF;
-    // Reset + espera (estilo ELECHOUSE: SRES uma vez, delay grande)
-    cc1101SendCommand(CC1101_SRES);
-    delay(200);  // Clones precisam de mais tempo após SRES
     
     // Tenta ler PARTNUM várias vezes (chip pode demorar a responder após reset)
     for (int i = 0; i < 5; i++) {
@@ -179,37 +185,43 @@ bool cc1101Init() {
 
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
 
-    // CORREÇÃO CRÍTICA: Usar IOCFG0=0x06 (RX FIFO) em vez de 0x0D (async serial).
-    // ESP32-DIV e ELECHOUSE usam 0x06 com sucesso. O modo 0x0D causa bug
-    // em clones do CC1101 (VERSION=0x14) onde MARCSTATE retorna 0x00.
-    // Com 0x06, GDO0 oscila com os dados recebidos e a ISR captura timings.
-    cc1101WriteReg(CC1101_IOCFG0, 0x06); 
-    cc1101WriteReg(CC1101_FIFOTHR, 0x47);
-    cc1101WriteReg(CC1101_PKTCTRL0, 0x05); 
-    cc1101WriteReg(0x10, 0x2B); 
-    cc1101WriteReg(0x11, 0xF8); 
-    cc1101WriteReg(CC1101_MDMCFG2, 0x30); 
-    cc1101WriteReg(0x13, 0x02);
-    cc1101WriteReg(0x14, 0xF8);
-    cc1101WriteReg(0x15, 0x47);
-    cc1101WriteReg(CC1101_MCSM0, 0x18);
-    cc1101WriteReg(0x19, 0x16);
-    cc1101WriteReg(0x1B, 0xC7);
-    cc1101WriteReg(CC1101_AGCCTRL1, 0x00);
-    cc1101WriteReg(0x1D, 0xB2);
-    cc1101WriteReg(CC1101_FREND0, 0x11);
-    cc1101WriteReg(CC1101_FSCAL3, 0xE9);
-    cc1101WriteReg(CC1101_FSCAL2, 0x2A);
-    cc1101WriteReg(CC1101_FSCAL1, 0x00);
-    cc1101WriteReg(CC1101_FSCAL0, 0x1F);
-    cc1101WriteReg(CC1101_TEST2, 0x81);
-    cc1101WriteReg(CC1101_TEST1, 0x35);
-    cc1101WriteReg(CC1101_TEST0, 0x09);
+    // === CONFIGURAÇÃO EXATA DA ELECHOUSE (ESP32-DIV) ===
+    cc1101WriteReg(0x0B, 0x06);  // FSCTRL1
+    cc1101WriteReg(0x00, 0x0B);  // IOCFG2
+    cc1101WriteReg(0x02, 0x06);  // IOCFG0 = RX FIFO
+    cc1101WriteReg(0x03, 0x47);  // FIFOTHR
+    cc1101WriteReg(0x08, 0x05);  // PKTCTRL0 = packet mode
+    cc1101WriteReg(0x07, 0x04);  // PKTCTRL1
+    cc1101WriteReg(0x10, 0x2B);  // MDMCFG4 = 325kHz BW
+    cc1101WriteReg(0x11, 0xF8);  // MDMCFG3
+    cc1101WriteReg(0x12, 0x30);  // MDMCFG2 = OOK
+    cc1101WriteReg(0x13, 0x02);  // MDMCFG1
+    cc1101WriteReg(0x14, 0xF8);  // MDMCFG0
+    cc1101WriteReg(0x15, 0x47);  // DEVIATN
+    cc1101WriteReg(0x18, 0x18);  // MCSM0 = auto-cal
+    cc1101WriteReg(0x19, 0x16);  // FOCCFG
+    cc1101WriteReg(0x1A, 0x1C);  // BSCFG
+    cc1101WriteReg(0x1B, 0xC7);  // AGCCTRL2
+    cc1101WriteReg(0x1C, 0x00);  // AGCCTRL1
+    cc1101WriteReg(0x1D, 0xB2);  // AGCCTRL0
+    cc1101WriteReg(0x21, 0x56);  // FREND1
+    cc1101WriteReg(0x22, 0x11);  // FREND0 = OOK PA1
+    cc1101WriteReg(0x23, 0xE9);  // FSCAL3
+    cc1101WriteReg(0x24, 0x2A);  // FSCAL2
+    cc1101WriteReg(0x25, 0x00);  // FSCAL1
+    cc1101WriteReg(0x26, 0x1F);  // FSCAL0
+    cc1101WriteReg(0x2C, 0x81);  // TEST2
+    cc1101WriteReg(0x2D, 0x35);  // TEST1
+    cc1101WriteReg(0x2E, 0x09);  // TEST0
+    cc1101WriteReg(0x06, 0x00);  // PKTLEN
+    cc1101WriteReg(0x09, 0x00);  // ADDR
 
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    cc1101Select(); spiCC1101.transfer(CC1101_PATABLE | CC1101_WRITE_BURST);
+    digitalWrite(CC1101_CSN, LOW);
+    while (digitalRead(CC1101_MISO));
+    spiCC1101.transfer(CC1101_PATABLE | CC1101_WRITE_BURST);
     for (int i = 0; i < 8; i++) spiCC1101.transfer(0xC0); 
-    cc1101Deselect(); spiCC1101.endTransaction();
+    digitalWrite(CC1101_CSN, HIGH); spiCC1101.endTransaction();
 
     cc1101Initialized = true;
     Serial.println("[CC1101] Configurado com sucesso!");
