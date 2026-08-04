@@ -183,9 +183,13 @@ bool cc1101Init() {
 
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
 
-    cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
-    cc1101WriteReg(CC1101_FIFOTHR, 0x07);
-    cc1101WriteReg(CC1101_PKTCTRL0, 0x32); 
+    // CORREÇÃO CRÍTICA: Usar IOCFG0=0x06 (RX FIFO) em vez de 0x0D (async serial).
+    // ESP32-DIV e ELECHOUSE usam 0x06 com sucesso. O modo 0x0D causa bug
+    // em clones do CC1101 (VERSION=0x14) onde MARCSTATE retorna 0x00.
+    // Com 0x06, GDO0 oscila com os dados recebidos e a ISR captura timings.
+    cc1101WriteReg(CC1101_IOCFG0, 0x06); 
+    cc1101WriteReg(CC1101_FIFOTHR, 0x47);
+    cc1101WriteReg(CC1101_PKTCTRL0, 0x05); 
     cc1101WriteReg(CC1101_MDMCFG4, 0x17); 
     cc1101WriteReg(CC1101_MDMCFG3, 0x32); 
     cc1101WriteReg(CC1101_MDMCFG2, 0x30); 
@@ -276,7 +280,8 @@ void cc1101StartCapture() {
     // CORREÇÃO: IOCFG0=0x0D mantém GDO0 como saída de dados assíncronos.
     // A ISR é ativada desde o início para contar transições (mesmo no HOPPING).
     // Se isr_count > 5 em menos de 100ms, há sinal real (não é só ruído).
-    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
+    // IOCFG0=0x06 (RX FIFO) para detectar sinal via ISR
+    cc1101WriteReg(CC1101_IOCFG0, 0x06);
     pinMode(CC1101_GDO0, INPUT); 
     cc1101SetFrequency(currentCapture.frequency);
     // CORREÇÃO: Sequência exata do datasheet TI para entrar em RX:
@@ -391,7 +396,7 @@ void cc1101CaptureLoop() {
 
 void cc1101StopCapture() {
     isr_enabled = false; 
-    cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
+    cc1101WriteReg(CC1101_IOCFG0, 0x06); 
     cc1101CopyActive = false;
     currentCapture.active = false;
     cc1101SendCommand(CC1101_SIDLE);
@@ -417,7 +422,7 @@ void cc1101ReplaySignal(uint8_t index) {
     }
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT);
-    cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
+    cc1101WriteReg(CC1101_IOCFG0, 0x06); 
     cc1101SendCommand(CC1101_SIDLE);
 }
 
@@ -449,7 +454,7 @@ void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
     }
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT);
-    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
+    cc1101WriteReg(CC1101_IOCFG0, 0x06);
     cc1101SendCommand(CC1101_SIDLE);
 }
 
@@ -468,7 +473,7 @@ void cc1101StopSubGHzJammer() {
     if (!cc1101Initialized) return;
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT);
-    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
+    cc1101WriteReg(CC1101_IOCFG0, 0x06);
     cc1101SendCommand(CC1101_SIDLE);
 }
 
@@ -486,7 +491,7 @@ void cc1101StartRollJam() {
     isr_enabled = false;
     cc1101SetFrequency(currentCapture.frequency);
     
-    cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
+    cc1101WriteReg(CC1101_IOCFG0, 0x06); 
     pinMode(CC1101_GDO0, INPUT);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX); 
@@ -551,7 +556,7 @@ void cc1101StopRollJam() {
     isr_enabled = false;
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT);
-    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
+    cc1101WriteReg(CC1101_IOCFG0, 0x06);
     cc1101SendCommand(CC1101_SIDLE);
 }
 
@@ -648,7 +653,7 @@ void cc1101TransmitRaw(uint32_t frequency, uint16_t* timings, uint8_t length) {
     }
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT);
-    cc1101WriteReg(CC1101_IOCFG0, 0x0D); 
+    cc1101WriteReg(CC1101_IOCFG0, 0x06); 
     cc1101SendCommand(CC1101_SIDLE);
 }
 
