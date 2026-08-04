@@ -123,7 +123,18 @@ void cc1101WriteReg(uint8_t reg, uint8_t value) {
 }
 void cc1101SendCommand(uint8_t cmd) {
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    cc1101Select(); spiCC1101.transfer(cmd); cc1101Deselect(); spiCC1101.endTransaction();
+    digitalWrite(CC1101_CSN, LOW);
+    // Espera MISO ficar LOW (chip ready) com limite de 50 iterações (5ms max).
+    // Isto é SEGURO: só roda DEPOIS de spiCC1101.begin() no cc1101Init().
+    // Sem isso, strobes (SIDLE/SRX/SCAL) são IGNORADOS pelo CC1101.
+    // Confirmado por diagnóstico: MARCSTATE=0x01 (IDLE) sem esta espera.
+    for (uint8_t i = 0; i < 50 && digitalRead(CC1101_MISO); i++) {
+        delayMicroseconds(100);
+    }
+    spiCC1101.transfer(cmd);
+    digitalWrite(CC1101_CSN, HIGH);
+    spiCC1101.endTransaction();
+    delayMicroseconds(100);
 }
 void cc1101SetFrequency(uint32_t freqHz) {
     uint32_t freqWord = (uint32_t)((freqHz / 26000000.0) * 65536);
