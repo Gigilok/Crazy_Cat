@@ -104,10 +104,11 @@ void IRAM_ATTR cc1101ISR() {
 void cc1101Select() { digitalWrite(CC1101_CSN, LOW); delayMicroseconds(10); }
 void cc1101Deselect() { digitalWrite(CC1101_CSN, HIGH); }
 
+// SPI functions - estilo ELECHOUSE (espera MISO com while + timeout)
 uint8_t cc1101ReadReg(uint8_t reg) {
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     digitalWrite(CC1101_CSN, LOW);
-    for (uint8_t i = 0; i < 50 && digitalRead(CC1101_MISO); i++) delayMicroseconds(100);
+    while (digitalRead(CC1101_MISO));
     spiCC1101.transfer(reg | CC1101_READ_SINGLE);
     uint8_t val = spiCC1101.transfer(0x00); 
     digitalWrite(CC1101_CSN, HIGH); spiCC1101.endTransaction();
@@ -116,7 +117,7 @@ uint8_t cc1101ReadReg(uint8_t reg) {
 uint8_t cc1101ReadStatus(uint8_t reg) {
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     digitalWrite(CC1101_CSN, LOW);
-    for (uint8_t i = 0; i < 50 && digitalRead(CC1101_MISO); i++) delayMicroseconds(100);
+    while (digitalRead(CC1101_MISO));
     spiCC1101.transfer(reg | CC1101_READ_BURST);
     uint8_t val = spiCC1101.transfer(0x00); 
     digitalWrite(CC1101_CSN, HIGH); spiCC1101.endTransaction();
@@ -125,22 +126,17 @@ uint8_t cc1101ReadStatus(uint8_t reg) {
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     digitalWrite(CC1101_CSN, LOW);
-    for (uint8_t i = 0; i < 50 && digitalRead(CC1101_MISO); i++) delayMicroseconds(100);
+    while (digitalRead(CC1101_MISO));
     spiCC1101.transfer(reg); spiCC1101.transfer(value);
     digitalWrite(CC1101_CSN, HIGH); spiCC1101.endTransaction();
 }
 void cc1101SendCommand(uint8_t cmd) {
     spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     digitalWrite(CC1101_CSN, LOW);
-    // Espera MISO ficar LOW (chip ready) com limite de 50 iterações (5ms max).
-    // Estilo Flipper Zero e ELECHOUSE — sem isso, strobes são IGNORADOS.
-    for (uint8_t i = 0; i < 50 && digitalRead(CC1101_MISO); i++) {
-        delayMicroseconds(100);
-    }
+    while (digitalRead(CC1101_MISO));
     spiCC1101.transfer(cmd);
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
-    delayMicroseconds(100);
 }
 
 // Função auxiliar: entra em RX sem verificação (estilo ELECHOUSE)
@@ -190,17 +186,17 @@ bool cc1101Init() {
     cc1101WriteReg(CC1101_IOCFG0, 0x06); 
     cc1101WriteReg(CC1101_FIFOTHR, 0x47);
     cc1101WriteReg(CC1101_PKTCTRL0, 0x05); 
-    cc1101WriteReg(CC1101_MDMCFG4, 0x17); 
-    cc1101WriteReg(CC1101_MDMCFG3, 0x32); 
+    cc1101WriteReg(0x10, 0x2B); 
+    cc1101WriteReg(0x11, 0xF8); 
     cc1101WriteReg(CC1101_MDMCFG2, 0x30); 
-    cc1101WriteReg(CC1101_MDMCFG1, 0x00);
-    cc1101WriteReg(CC1101_MDMCFG0, 0x00);
-    cc1101WriteReg(CC1101_DEVIATN, 0x15);
+    cc1101WriteReg(0x13, 0x02);
+    cc1101WriteReg(0x14, 0xF8);
+    cc1101WriteReg(0x15, 0x47);
     cc1101WriteReg(CC1101_MCSM0, 0x18);
-    cc1101WriteReg(CC1101_FOCCFG, 0x18);
-    cc1101WriteReg(CC1101_AGCCTRL2, 0x07);
+    cc1101WriteReg(0x19, 0x16);
+    cc1101WriteReg(0x1B, 0xC7);
     cc1101WriteReg(CC1101_AGCCTRL1, 0x00);
-    cc1101WriteReg(CC1101_AGCCTRL0, 0x91);
+    cc1101WriteReg(0x1D, 0xB2);
     cc1101WriteReg(CC1101_FREND0, 0x11);
     cc1101WriteReg(CC1101_FSCAL3, 0xE9);
     cc1101WriteReg(CC1101_FSCAL2, 0x2A);
@@ -217,51 +213,6 @@ bool cc1101Init() {
 
     cc1101Initialized = true;
     Serial.println("[CC1101] Configurado com sucesso!");
-    
-    // === DIAGNÓSTICO COMPLETO ===
-    Serial.println("[CC1101] === DIAGNÓSTICO COMPLETO ===");
-    
-    // Teste 1: ler status byte + PARTNUM + VERSION
-    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    cc1101Select();
-    uint8_t status1 = spiCC1101.transfer(0x30 | 0xC0);  // READ_BURST PARTNUM
-    uint8_t partnum_val = spiCC1101.transfer(0x00);
-    cc1101Deselect();
-    spiCC1101.endTransaction();
-    
-    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
-    cc1101Select();
-    uint8_t status2 = spiCC1101.transfer(0x31 | 0xC0);  // READ_BURST VERSION
-    uint8_t version_val = spiCC1101.transfer(0x00);
-    cc1101Deselect();
-    spiCC1101.endTransaction();
-    
-    Serial.printf("  STATUS BYTE (PARTNUM) = 0x%02X (bit7=CHIP_RDYn, 0=pronto)\n", status1);
-    Serial.printf("  STATUS BYTE (VERSION) = 0x%02X\n", status2);
-    Serial.printf("  PARTNUM  = 0x%02X (esperado 0x00)\n", partnum_val);
-    Serial.printf("  VERSION  = 0x%02X (esperado 0x04 ou 0x14)\n", version_val);
-    
-    // Teste 2: write-readback para verificar se SPI write funciona
-    cc1101WriteReg(0x02, 0xAB);  // escreve 0xAB no IOCFG0
-    uint8_t readback = cc1101ReadReg(0x02);  // lê de volta
-    Serial.printf("  WRITE-READBACK: escreveu 0xAB no IOCFG0, leu 0x%02X\n", readback);
-    cc1101WriteReg(0x02, 0x06);  // restaura valor correto (RX FIFO mode)
-    
-    // Teste 3: ler registradores de configuração
-    Serial.printf("  IOCFG0    = 0x%02X (esperado 0x0D)\n", cc1101ReadReg(0x02));
-    Serial.printf("  PKTCTRL0  = 0x%02X (esperado 0x32)\n", cc1101ReadReg(0x08));
-    Serial.printf("  MDMCFG4   = 0x%02X (esperado 0x17)\n", cc1101ReadReg(0x10));
-    Serial.printf("  MDMCFG2   = 0x%02X (esperado 0x30)\n", cc1101ReadReg(0x12));
-    Serial.printf("  MDMCFG1   = 0x%02X (esperado 0x00)\n", cc1101ReadReg(0x13));
-    Serial.printf("  AGCCTRL2  = 0x%02X (esperado 0x07)\n", cc1101ReadReg(0x1B));
-    Serial.printf("  FREQ2     = 0x%02X\n", cc1101ReadReg(0x0D));
-    Serial.printf("  FREQ1     = 0x%02X\n", cc1101ReadReg(0x0E));
-    Serial.printf("  FREQ0     = 0x%02X\n", cc1101ReadReg(0x0F));
-    Serial.printf("  MARCSTATE = 0x%02X (0x0D=RX, 0x01=IDLE, 0x00=SLEEP)\n", cc1101ReadStatus(0x35) & 0x1F);
-    Serial.printf("  GDO0 pin  = %d\n", digitalRead(CC1101_GDO0));
-    Serial.println("[CC1101] === FIM DO DIAGNÓSTICO ===");
-    Serial.flush();
-    
     return true;
 }
 
