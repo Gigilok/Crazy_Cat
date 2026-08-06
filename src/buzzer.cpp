@@ -1,29 +1,38 @@
 #include "config.h"
 
+// ============================================================
+// BUZZER - PWM hardware (muito mais alto que digitalWrite)
+// Usa LEDC do ESP32 para gerar onda quadrada estavel
+// ============================================================
+
+#define BUZZER_PWM_CHANNEL  7       // canal LEDC (0-15, 7 evita conflito com display)
+#define BUZZER_PWM_FREQ     2730    // 2730 Hz = frequencia de ressonancia do piezo
+#define BUZZER_PWM_RES      8       // 8 bits = 0-255
+
+static bool buzzerReady = false;
+
 void buzzerInit() {
-    // Inicia em alta impedância para não interferir no boot do ESP32
-    pinMode(BUZZER_PIN, INPUT);
+    // Configura PWM hardware no pino do buzzer
+    ledcAttachPin(BUZZER_PIN, BUZZER_PWM_CHANNEL);
+    ledcSetup(BUZZER_PWM_CHANNEL, BUZZER_PWM_FREQ, BUZZER_PWM_RES);
+    ledcWrite(BUZZER_PWM_CHANNEL, 0);  // comeca desligado
+    buzzerReady = true;
 }
 
 void beep(int durationMs = 50) {
-    // Só configura como saída no momento do bip
-    pinMode(BUZZER_PIN, OUTPUT);
-    
-    // Gera onda quadrada manual (2000Hz)
-    int cycles = durationMs * 2; 
-    for (int i = 0; i < cycles; i++) {
-        digitalWrite(BUZZER_PIN, HIGH);
-        delayMicroseconds(250);
-        digitalWrite(BUZZER_PIN, LOW);
-        delayMicroseconds(250);
+    if (!buzzerReady) {
+        buzzerInit();
     }
-    
-    // Volta para INPUT imediatamente após o bip
-    pinMode(BUZZER_PIN, INPUT);
+    // 50% duty cycle = volume MAXIMO do piezo
+    ledcWrite(BUZZER_PWM_CHANNEL, 128);
+    delay(durationMs);
+    ledcWrite(BUZZER_PWM_CHANNEL, 0);
+    // Pequeno delay apos o bip para evitar ruido de transicao
+    delayMicroseconds(200);
 }
 
 void doubleBeep() {
-    beep(40);
-    delay(50);
-    beep(40);
+    beep(60);
+    delay(60);
+    beep(60);
 }
