@@ -149,7 +149,7 @@ bool displayInit() {
     Wire.begin(OLED_SDA, OLED_SCK);
     Wire.setClock(400000);
     Wire.setTimeout(500);
-    
+
     if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDRESS)) {
         return false;
     }
@@ -157,6 +157,14 @@ bool displayInit() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.display();
+
+    // Configura pino ADC da bateria (se habilitado)
+#if BATTERY_PIN != 255
+    analogReadResolution(12);          // 12 bits (0-4095)
+    analogSetAttenuation(ADC_11db);    // ate 3.3V full range
+    pinMode(BATTERY_PIN, INPUT);
+#endif
+
     return true;
 }
 
@@ -183,12 +191,96 @@ void drawCenteredText(int y, const char* text, uint8_t size) {
     display.print(text);
 }
 
+// ============================================================
+// BATERIA - leitura e desenho
+// ============================================================
+// Le a tensao da bateria via divisor de tensao no BATTERY_PIN.
+// Retorna a porcentagem (0-100) baseada em BATTERY_FULL_MV e
+// BATTERY_EMPTY_MV do config.h.
+//
+// Usa media movel de 16 amostras para reduzir ruido do ADC.
+uint8_t readBatteryPercent() {
+#if BATTERY_PIN == 255
+    // Sem hardware de leitura - retorna 100% fixo
+    return 100;
+#else
+    static uint16_t samples[16];
+    static uint8_t sampleIdx = 0;
+    static bool initialized = false;
+
+    if (!initialized) {
+        for (int i = 0; i < 16; i++) samples[i] = 0;
+        initialized = true;
+    }
+
+    // Le ADC (12 bits, 0-4095 = 0-3.3V)
+    uint16_t adcRaw = analogRead(BATTERY_PIN);
+
+    // Converte para milivolts na bateria (considerando divisor)
+    // Vbat = (adcRaw / 4095) * 3300 * BATTERY_DIVIDER
+    uint32_t vbatMv = (uint32_t)(adcRaw)*3300 * BATTERY_DIVIDER / 4095;
+
+    // Atualiza buffer de amostras
+    samples[sampleIdx] = vbatMv;
+    sampleIdx = (sampleIdx + 1) % 16;
+
+    // Calcula media
+    uint32_t sum = 0;
+    for (int i = 0; i < 16; i++) sum += samples[i];
+    uint32_t avgMv = sum / 16;
+
+    // Converte para porcentagem
+    if (avgMv >= BATTERY_FULL_MV) return 100;
+    if (avgMv <= BATTERY_EMPTY_MV) return 0;
+    return (uint8_t)((avgMv - BATTERY_EMPTY_MV) * 100 /
+                     (BATTERY_FULL_MV - BATTERY_EMPTY_MV));
+#endif
+}
+
+// Desenha um icone de bateria no canto superior direito.
+// Formato: [||||]  - caixa com 4 barras internas
+// y=0, x=110 a 124 (15px largura, 8px altura)
+void drawBatteryIcon(uint8_t percent) {
+    // Coordenadas do icone (canto sup direito do header)
+    const int8_t x = 110;
+    const int8_t y = 1;
+    const int8_t w = 14;
+    const int8_t h = 8;
+
+    // Cor preta (header e branco)
+    display.setTextColor(SSD1306_BLACK);
+
+    // Desenha contorno da bateria
+    display.drawRect(x, y, w - 2, h, SSD1306_BLACK);
+    // "Pino" positivo (terminall +)
+    display.fillRect(x + w - 2, y + 2, 2, h - 4, SSD1306_BLACK);
+
+    // Calcula largura do preenchimento
+    // Area interna: x+1 a x+w-4 (10px largura)
+    int8_t fillW = (w - 4) * percent / 100;
+    if (fillW > 0) {
+        display.fillRect(x + 1, y + 1, fillW, h - 2, SSD1306_BLACK);
+    }
+
+    // Desenha porcentagem em texto (3 chars: 0-100)
+    // Posiciona a esquerda do icone
+    display.setTextSize(1);
+    display.setCursor(x - 18, y);
+    if (percent < 100) {
+        display.printf("%2d%%", percent);
+    } else {
+        display.print("100");
+    }
+}
+
 void drawMenuHeader(const char* title) {
     display.fillRect(0, 0, SCREEN_WIDTH, 10, SSD1306_WHITE);
     display.setTextColor(SSD1306_BLACK);
     display.setTextSize(1);
     display.setCursor(2, 1);
     display.print(title);
+    // Desenha medidor de bateria no canto direito
+    drawBatteryIcon(readBatteryPercent());
     display.setTextColor(SSD1306_WHITE);
 }
 
