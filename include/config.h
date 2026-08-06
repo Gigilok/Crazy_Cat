@@ -30,6 +30,27 @@
 #define BUZZER_PIN  4
 
 // ============================================================
+// BATERIA - medidor de carga
+// ============================================================
+// Pino ADC para leitura da tensao da bateria LiPo 3.7V (1S).
+// GPIO 34 (ADC1_CH6) e input-only, seguro para leitura analogica.
+//
+// HARDWARE NECESSARIO: divisor de tensao 2:1 com 2 resistores de 100kΩ:
+//   BATERIA LiPo (+) ──[100kΩ]── GPIO34 ──[100kΩ]── GND
+//
+// IMPORTANTE: o fio do divisor deve ir DIRETO no + da bateria LiPo,
+// ANTES do modulo de carga. Assim medimos a tensao real da celula,
+// nao a tensao regulada de 5V (que e sempre constante).
+//
+// Com divisor 2:1, o GPIO34 recebe:
+//   - 4.2V (bateria cheia)  -> 2.1V no GPIO (seguro, limite e 3.3V)
+//   - 3.0V (bateria fraca)  -> 1.5V no GPIO
+#define BATTERY_PIN         34
+#define BATTERY_DIVIDER     2.0     // fator do divisor (Vin = Vadc * 2.0)
+#define BATTERY_FULL_MV     4200    // 100% (LiPo cheia = 4.2V)
+#define BATTERY_EMPTY_MV    3000    // 0%   (LiPo descarregada = 3.0V)
+
+// ============================================================
 // CONFIGURACOES
 // ============================================================
 #define SCREEN_WIDTH    128
