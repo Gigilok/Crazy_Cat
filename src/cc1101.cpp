@@ -177,8 +177,11 @@ static bool waitMisoReady() {
 
 // Select = CSN LOW + espera chip ready (CHIP_RDYn LOW)
 // Retorna true se o chip ficou pronto para comunicação.
+// FIX: Adicionado delay de 20µs após CSN LOW para garantir
+// que o chip processe a borda de descida, mesmo com MISO já LOW.
 static bool cc1101Select() {
     digitalWrite(CC1101_CSN, LOW);
+    delayMicroseconds(20);  // FIX: tempo mínimo para chip processar CSN falling edge
     bool ready = waitMisoReady();
     if (!ready) {
         digitalWrite(CC1101_CSN, HIGH);
@@ -519,52 +522,90 @@ static uint8_t readMarcState() {
 }
 
 static bool cc1101GoRx(uint32_t freqHz) {
-    // 1. Garante que está em IDLE
-    cc1101SendCommand(CC1101_SIDLE);
-    delay(1);
+    // 1. Seta frequência (3 register writes)
+    cc1101SetFrequency(freqHz);
 
-    uint8_t state = readMarcState();
-    if (state != 0x01) {
-        Serial.printf("[CC1101] GoRx: estado 0x%02X nao e IDLE, tentando SIDLE...\n", state);
-        cc1101SendCommand(CC1101_SIDLE);
-        delay(5);
-        state = readMarcState();
-        if (state != 0x01) {
-            Serial.printf("[CC1101] GoRx: FALHOU, nao consegue ir para IDLE (state=0x%02X)\n", state);
+    // 2. Entra em RX usando PADRÃO ELECHOUSE:
+    //    SIDLE + SRX na MESMA sessão CSN!
+    //    Sem SCAL — MCSM0.FS_AUTOCAL=1 faz auto-calibration IDLE→RX
+    spiCC1101.beginTransaction(CC1101_SPI_SETTINGS);
+    digitalWrite(CC1101_CSN, LOW);
+    delayMicroseconds(20);
+
+    // Espera chip pronto (MISO LOW)
+    uint32_t t0 = millis();
+    while (digitalRead(CC1101_MISO) != LOW) {
+        if (millis() - t0 > 200) {
+            Serial.println("[CC1101] GoRx: MISO timeout!");
+            digitalWrite(CC1101_CSN, HIGH);
+            delayMicroseconds(50);
+            spiCC1101.endTransaction();
             return false;
         }
     }
 
-    // 2. Seta frequência
-    cc1101SetFrequency(freqHz);
+    // Envia SIDLE e SRX back-to-back (MESMA sessão CSN = padrão ELECHOUSE)
+    spiCC1101.transfer(CC1101_SIDLE);
+    delayMicroseconds(10);
+    spiCC1101.transfer(CC1101_SRX);
 
-    // 3. Calibra VCO
-    cc1101SendCommand(CC1101_SCAL);
-    delay(3);
-    state = readMarcState();
-    Serial.printf("[CC1101] GoRx: pos-SCAL state=0x%02X\n", state);
+    // Espera chip terminar calibração RX (MISO vai HIGH→LOW)
+    t0 = millis();
+    while (digitalRead(CC1101_MISO) != LOW) {
+        if (millis() - t0 > 500) {
+            Serial.println("[CC1101] GoRx: timeout esperando RX ready");
+            break;
+        }
+    }
 
-    // 4. Entra em RX
-    cc1101SendCommand(CC1101_SRX);
-    delay(5);
-    state = readMarcState();
+    // CSN HIGH antes de endTransaction (como no fix do reset)
+    digitalWrite(CC1101_CSN, HIGH);
+    delayMicroseconds(50);
+    spiCC1101.endTransaction();
 
-    // Estados válidos em RX: 0x0D (RX), 0x06/0x07/0x0A/0x0B (transição)
+    // 3. Verifica estado
+    delay(2);
+    uint8_t state = readMarcState();
+    Serial.printf("[CC1101] GoRx: apos SIDLE+SRX, state=0x%02X @ %lu Hz\n", state, freqHz);
+
     if (state == 0x0D || state == 0x0E || state == 0x0F) {
-        Serial.printf("[CC1101] GoRx: RX OK @ %lu Hz (state=0x%02X)\n", freqHz, state);
+        Serial.printf("[CC1101] GoRx: RX OK @ %lu Hz\n", freqHz);
         return true;
     }
 
-    // Tentativa 2: voltou para IDLE, retenta
-    if (state == 0x01) {
-        Serial.printf("[CC1101] GoRx: voltou p/ IDLE, retentando SRX...\n");
-        cc1101SendCommand(CC1101_SRX);
-        delay(10);
-        state = readMarcState();
-        if (state == 0x0D) {
-            Serial.printf("[CC1101] GoRx: RX OK na 2a tentativa\n");
-            return true;
+    // 4. Fallback: reset completo + tente de novo
+    Serial.printf("[CC1101] GoRx: falhou (state=0x%02X), reset + retentativa...\n", state);
+    if (!cc1101Reset()) return false;
+    cc1101ConfigureRegs();
+    delay(2);
+    cc1101SetFrequency(freqHz);
+
+    // Tenta SRX direto (sem SIDLE, chip deve estar em IDLE apos reset)
+    spiCC1101.beginTransaction(CC1101_SPI_SETTINGS);
+    digitalWrite(CC1101_CSN, LOW);
+    delayMicroseconds(20);
+    t0 = millis();
+    while (digitalRead(CC1101_MISO) != LOW) {
+        if (millis() - t0 > 200) {
+            digitalWrite(CC1101_CSN, HIGH);
+            spiCC1101.endTransaction();
+            return false;
         }
+    }
+    spiCC1101.transfer(CC1101_SRX);
+    t0 = millis();
+    while (digitalRead(CC1101_MISO) != LOW) {
+        if (millis() - t0 > 500) break;
+    }
+    digitalWrite(CC1101_CSN, HIGH);
+    delayMicroseconds(50);
+    spiCC1101.endTransaction();
+
+    delay(2);
+    state = readMarcState();
+    if (state == 0x0D) {
+        Serial.printf("[CC1101] GoRx: RX OK na 2a tentativa (reset)\n");
+        return true;
     }
 
     Serial.printf("[CC1101] GoRx: FALHOU, state final=0x%02X\n", state);
@@ -595,9 +636,8 @@ void cc1101StartCapture() {
     isr_count = 0;
     capture_started = false;
 
-    // GDO0 para async serial data output
-    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
-    pinMode(CC1101_GDO0, INPUT_PULLUP);
+    // NOTA: IOCFG0 já está 0x0D do cc1101Wake() e pinMode já foi feito no init.
+    // Não re-enviamos aqui para evitar transação SPI desnecessária.
 
     // Entra em RX
     bool rxOk = cc1101GoRx(currentCapture.frequency);
