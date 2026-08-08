@@ -542,61 +542,128 @@ static uint8_t readMarcState() {
     return cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
 }
 
+// Lê o byte bruto de status do MARCSTATE (sem máscara)
+static uint8_t readMarcStateRaw() {
+    return cc1101ReadStatus(CC1101_MARCSTATE);
+}
+
 static bool cc1101GoRx(uint32_t freqHz) {
-    // === PADRÃO ELECHOUSE (DIV usa exatamente isso): ===
-    // 1. cc1101SendCommand(SIDLE) — transação SPI separada
-    // 2. cc1101SendCommand(SRX)  — transação SPI separada
-    // Cada strobe é uma transação SPI completa com CSN toggle.
-    // MCSM0.FS_AUTOCAL=1 faz auto-calibration automaticamente na transição IDLE→RX.
-    // NÃO enviamos SCAL manual — igual DIV e Flipper.
-
-    // 1. Seta frequência
+    uint8_t state, raw;
+    
+    // === DIAGNÓSTICO PASSO-A-PASSO ===
+    // Cada passo lê MARCSTATE para descobrir ONDE o chip vai para SLEEP
+    
+    // PASSO 0: Estado antes de qualquer coisa
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP0: raw=0x%02X state=0x%02X MISO=%d\n", 
+        raw, state, digitalRead(CC1101_MISO));
+    
+    if (state != 0x01) {
+        Serial.printf("[CC1101] GoRx: ERRO - chip nao esta em IDLE (0x%02X)!\n", state);
+        return false;
+    }
+    
+    // PASSO 1: Seta frequência e verifica SPI lendo de volta
     cc1101SetFrequency(freqHz);
-
-    // 2. SIDLE — sai de qualquer estado, volta para IDLE
+    uint8_t freq2back = cc1101ReadReg(CC1101_FREQ2);
+    uint32_t freqWord = (uint32_t)((freqHz / 26000000.0) * 65536);
+    uint8_t freq2expect = (freqWord >> 16) & 0xFF;
+    Serial.printf("[CC1101] GoRx STEP1: FREQ2=0x%02X (expect 0x%02X) SPI=%s\n", 
+        freq2back, freq2expect, freq2back == freq2expect ? "OK" : "FAIL!");
+    
+    // PASSO 2: Estado após setFrequency
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP2: pos-setFreq raw=0x%02X state=0x%02X\n", raw, state);
+    if (state != 0x01) {
+        Serial.printf("[CC1101] GoRx: FALHA - setFrequency mudou estado para 0x%02X!\n", state);
+    }
+    
+    // PASSO 3: Envia SIDLE
     cc1101SendCommand(CC1101_SIDLE);
-    delayMicroseconds(100);
-
-    // 3. SRX — entra em RX (auto-calibration acontece aqui automaticamente)
+    
+    // PASSO 4: Estado após SIDLE
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP3: pos-SIDLE raw=0x%02X state=0x%02X MISO=%d\n", 
+        raw, state, digitalRead(CC1101_MISO));
+    if (state != 0x01) {
+        Serial.printf("[CC1101] GoRx: FALHA - SIDLE mudou estado para 0x%02X!\n", state);
+        // Tenta recovery com SIDLE de novo
+        cc1101SendCommand(CC1101_SIDLE);
+        delay(2);
+        raw = readMarcStateRaw();
+        state = raw & 0x1F;
+        Serial.printf("[CC1101] GoRx STEP3b: pos-recovery raw=0x%02X state=0x%02X\n", raw, state);
+    }
+    
+    // PASSO 5: Envia SRX
     cc1101SendCommand(CC1101_SRX);
-
-    // 4. Espera o chip terminar calibração e entrar em RX
-    //    (MISO sobe durante cal, volta LOW quando RX está pronto)
+    
+    // PASSO 6: Estado IMEDIATO após SRX (sem delay nenhum)
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP4: pos-SRX(0ms) raw=0x%02X state=0x%02X MISO=%d\n", 
+        raw, state, digitalRead(CC1101_MISO));
+    
+    // PASSO 7: Estado após 2ms
+    delay(2);
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP5: pos-SRX(2ms) raw=0x%02X state=0x%02X MISO=%d\n", 
+        raw, state, digitalRead(CC1101_MISO));
+    
+    // PASSO 8: Estado após 10ms
+    delay(8);
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP6: pos-SRX(10ms) raw=0x%02X state=0x%02X MISO=%d\n", 
+        raw, state, digitalRead(CC1101_MISO));
+    
+    if (state == 0x0D || state == 0x0E || state == 0x0F) {
+        Serial.printf("[CC1101] GoRx: RX OK @ %lu Hz\n", freqHz);
+        return true;
+    }
+    
+    // FALLBACK: Reset completo + reconfig + tentativa Flipper-style
+    Serial.printf("[CC1101] GoRx: fallback - reset completo...\n");
+    if (!cc1101Reset()) return false;
+    cc1101ConfigureRegs();
+    delay(2);
+    
+    // Flipper-style: set freq → SCAL → wait IDLE → SFRX → SRX
+    cc1101SetFrequency(freqHz);
+    cc1101SendCommand(CC1101_SCAL);
+    
+    // Espera calibração terminar (chip volta a IDLE)
     uint32_t t0 = millis();
-    while (digitalRead(CC1101_MISO) != LOW) {
-        if (millis() - t0 > 500) {
-            Serial.println("[CC1101] GoRx: timeout esperando RX ready");
-            break;
-        }
-    }
-
-    // 5. Verifica estado
+    do {
+        raw = readMarcStateRaw();
+        state = raw & 0x1F;
+        if (state == 0x01) break;
+        delay(1);
+    } while (millis() - t0 < 100);
+    Serial.printf("[CC1101] GoRx STEP7: pos-SCAL raw=0x%02X state=0x%02X (%lums)\n", 
+        raw, state, millis() - t0);
+    
+    // SFRX - flush FIFO (Flipper faz isso)
+    cc1101SendCommand(CC1101_SFRX);
     delay(1);
-    uint8_t state = readMarcState();
-    Serial.printf("[CC1101] GoRx: state=0x%02X @ %lu Hz\n", state, freqHz);
-
-    if (state == 0x0D || state == 0x0E || state == 0x0F) {
-        return true;
-    }
-
-    // 6. Fallback — tenta mais uma vez com SIDLE + SRX
-    Serial.printf("[CC1101] GoRx: falhou (state=0x%02X), retentativa...\n", state);
-    cc1101SendCommand(CC1101_SIDLE);
-    delay(2);
+    
+    // SRX
     cc1101SendCommand(CC1101_SRX);
-
-    t0 = millis();
-    while (digitalRead(CC1101_MISO) != LOW) {
-        if (millis() - t0 > 500) break;
-    }
-
-    delay(2);
-    state = readMarcState();
+    delay(5);
+    
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP8: pos-flipper-RX raw=0x%02X state=0x%02X\n", raw, state);
+    
     if (state == 0x0D || state == 0x0E || state == 0x0F) {
-        Serial.printf("[CC1101] GoRx: RX OK na 2a tentativa\n");
+        Serial.printf("[CC1101] GoRx: RX OK (flipper-style) @ %lu Hz\n", freqHz);
         return true;
     }
-
+    
     Serial.printf("[CC1101] GoRx: FALHOU, state final=0x%02X\n", state);
     return false;
 }
