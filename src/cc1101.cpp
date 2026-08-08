@@ -139,14 +139,32 @@ void IRAM_ATTR cc1101ISR() {
 // ============================================================
 // HELPERS DE PINAGEM
 // ============================================================
-void cc1101Select()   { digitalWrite(CC1101_CSN, LOW);  delayMicroseconds(10); }
+// CRITICO: apos CSN LOW, devemos esperar o chip ficar pronto.
+// O CC1101 segura MISO em HIGH quando esta ocupado (wake-up, calibracao,
+// transicao de estado). Se comecarmos a transferencia antes do chip
+// estar pronto, ele responde com 0x00 (lixo).
+//
+// Bug historico: versoes anteriores NAO faziam essa espera, causando
+// todos os registradores lerem 0x00 mesmo com chip funcionando.
+void cc1101Select() {
+    digitalWrite(CC1101_CSN, LOW);
+    // Espera MISO ir para LOW (chip pronto) - timeout 1ms
+    for (uint16_t i = 0; i < 100; i++) {
+        if (digitalRead(CC1101_MISO) == LOW) break;
+        delayMicroseconds(10);
+    }
+    // Pequeno delay de seguranca (alguns clones sao lentos)
+    delayMicroseconds(30);
+}
 void cc1101Deselect() { digitalWrite(CC1101_CSN, HIGH); }
 
 // ============================================================
 // FUNCOES DE SPI MANUAL (usa HSPI dedicado, nao VSPI)
+// SPI a 1MHz para maxima compatibilidade com clones chineses
+// (4MHz pode causar leituras erradas em modulos baratos)
 // ============================================================
 uint8_t cc1101ReadReg(uint8_t reg) {
-    spiCC1101.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     cc1101Select();
     spiCC1101.transfer(reg | CC1101_READ_SINGLE);
     uint8_t val = spiCC1101.transfer(0x00);
@@ -156,7 +174,7 @@ uint8_t cc1101ReadReg(uint8_t reg) {
 }
 
 uint8_t cc1101ReadStatus(uint8_t reg) {
-    spiCC1101.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     cc1101Select();
     spiCC1101.transfer(reg | CC1101_READ_BURST);
     uint8_t val = spiCC1101.transfer(0x00);
@@ -166,7 +184,7 @@ uint8_t cc1101ReadStatus(uint8_t reg) {
 }
 
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
-    spiCC1101.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
     cc1101Select();
     spiCC1101.transfer(reg);
     spiCC1101.transfer(value);
@@ -175,12 +193,10 @@ void cc1101WriteReg(uint8_t reg, uint8_t value) {
 }
 
 void cc1101SendCommand(uint8_t cmd) {
-    spiCC1101.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
-    digitalWrite(CC1101_CSN, LOW);
-    // Espera MISO ficar LOW (chip ready) - max 5ms
-    for (uint8_t i = 0; i < 50 && digitalRead(CC1101_MISO); i++) delayMicroseconds(100);
+    spiCC1101.beginTransaction(SPISettings(1000000, MSBFIRST, SPI_MODE0));
+    cc1101Select();
     spiCC1101.transfer(cmd);
-    digitalWrite(CC1101_CSN, HIGH);
+    cc1101Deselect();
     spiCC1101.endTransaction();
     delayMicroseconds(100);
 }
@@ -197,7 +213,7 @@ void cc1101SetFrequency(uint32_t freqHz) {
 // INICIALIZACAO
 // ============================================================
 bool cc1101Init() {
-    Serial.println(F("[CC1101] Inicializando v3.5 (SPI manual HSPI)..."));
+    Serial.println(F("[CC1101] Inicializando v3.6 (SPI timing fix)..."));
     Serial.flush();
 
     // 1. Inicia barramento SPI dedicado (HSPI) nos pinos do CC1101
@@ -229,6 +245,34 @@ bool cc1101Init() {
     Serial.printf("[CC1101] PARTNUM lido = 0x%02X\n", partnum);
     if (partnum == 0xFF) {
         Serial.println(F("[CC1101] FAIL: modulo nao responde (PARTNUM=0xFF)"));
+        Serial.println(F("[CC1101] Verifique alimentacao 3.3V e pinos SPI"));
+        return false;
+    }
+
+    // DETECCAO DE MISO PRESO EM LOW:
+    // PARTNUM=0x00 pode ser valor correto OU MISO preso em LOW.
+    // Para diferenciar, lemos VERSION - se tambem for 0x00, MISO esta preso.
+    uint8_t version_check = cc1101ReadStatus(CC1101_VERSION);
+    Serial.printf("[CC1101] VERSION lido = 0x%02X\n", version_check);
+    if (version_check == 0x00) {
+        Serial.println(F(""));
+        Serial.println(F("[CC1101] ========================================"));
+        Serial.println(F("[CC1101]  ERRO CRITICO: MISO PRESO EM LOW!"));
+        Serial.println(F("[CC1101] ========================================"));
+        Serial.println(F("[CC1101] Sintoma: todos registradores leem 0x00"));
+        Serial.println(F("[CC1101] Causa mais provavel (em ordem):"));
+        Serial.println(F("[CC1101]   1. Resistor pull-down no GPIO 12 em CURTO"));
+        Serial.println(F("[CC1101]      -> DESSOLDE o resistor e teste sem ele"));
+        Serial.println(F("[CC1101]   2. Fio MISO do CC1101 desconectado/quebrado"));
+        Serial.println(F("[CC1101]      -> Verifique continuidade do fio"));
+        Serial.println(F("[CC1101]   3. Curto fisico entre GPIO 12 e GND"));
+        Serial.println(F("[CC1101]      -> Multimetro: GPIO12<->GND nao deve apitar"));
+        Serial.println(F("[CC1101]   4. Pino GPIO 12 queimado no ESP32"));
+        Serial.println(F("[CC1101]      -> Mude CC1101_MISO no config.h para outro pino"));
+        Serial.println(F("[CC1101] ========================================"));
+        Serial.println(F("[CC1101] Continuando boot sem CC1101..."));
+        Serial.println(F(""));
+        Serial.flush();
         return false;
     }
 
@@ -279,6 +323,17 @@ bool cc1101Init() {
 
     // === DIAGNOSTICO COMPLETO ===
     Serial.println(F("[CC1101] === DIAGNOSTICO COMPLETO ==="));
+
+    // TESTE DE WRITE-READBACK: prova irrefutavel de MISO preso
+    cc1101WriteReg(CC1101_IOCFG0, 0xAB);
+    delay(2);
+    uint8_t readback = cc1101ReadReg(CC1101_IOCFG0);
+    Serial.printf("  TESTE WRITE-READBACK: escreveu 0xAB, leu 0x%02X\n", readback);
+    if (readback != 0xAB) {
+        Serial.println(F("  >>> FALHA NO READBACK! MISO preso em LOW."));
+        Serial.println(F("  >>> Causa: curto no GPIO 12 ou fio MISO desconectado."));
+    }
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D);  // restaura valor correto
 
     uint8_t partnum_val = cc1101ReadStatus(CC1101_PARTNUM);
     uint8_t version_val = cc1101ReadStatus(CC1101_VERSION);
