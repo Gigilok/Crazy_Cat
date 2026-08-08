@@ -474,10 +474,13 @@ extern void cc1101SetFrequency(uint32_t);
 extern void cc1101WriteReg(uint8_t, uint8_t);
 extern void cc1101SendCommand(uint8_t);
 extern void cc1101StopSubGHzJammer();
+extern bool cc1101Wake();
+extern void cc1101Sleep();
 
 void startDroneJammer() {
     if (droneJammerActive) return;
     if (!cc1101Initialized) return;
+    if (!cc1101Wake()) return;
     droneJammerActive = true;
     cc1101StopSubGHzJammer();
     delay(10);
@@ -497,6 +500,7 @@ void stopDroneJammer() {
     pinMode(CC1101_GDO0, INPUT);
     cc1101WriteReg(0x02, 0x0D);
     cc1101SendCommand(0x36);
+    cc1101Sleep();
 }
 
 struct DroneLocation {
