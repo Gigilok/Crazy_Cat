@@ -468,6 +468,90 @@ bool cc1101Init() {
 }
 
 // ============================================================
+// HELPER: Força chip em RX com verificação de estado
+// Sequência robusta baseada no Flipper Zero firmware
+// ============================================================
+static uint8_t readMarcState() {
+    return cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
+}
+
+static bool cc1101GoRx(uint32_t freqHz) {
+    // 1. Força IDLE
+    cc1101SendCommand(CC1101_SIDLE);
+    delay(2);
+    uint8_t state = readMarcState();
+    if (state != 0x01) {
+        // Se não está em IDLE, tenta SRES + reinit
+        Serial.printf("[CC1101] GoRx: estado inesperado 0x%02X, forcando reset\n", state);
+        cc1101Reset();
+        // Re-escreve registradores críticos após reset
+        cc1101WriteReg(CC1101_IOCFG0,   0x0D);
+        cc1101WriteReg(CC1101_FIFOTHR,  0x47);
+        cc1101WriteReg(CC1101_FSCTRL1,  0x06);
+        cc1101WriteReg(CC1101_PKTCTRL0, 0x32);
+        cc1101WriteReg(CC1101_PKTCTRL1, 0x04);
+        cc1101WriteReg(CC1101_MDMCFG4,  0x67);
+        cc1101WriteReg(CC1101_MDMCFG3,  0x32);
+        cc1101WriteReg(CC1101_MDMCFG2,  0x30);
+        cc1101WriteReg(CC1101_MDMCFG1,  0x00);
+        cc1101WriteReg(CC1101_MDMCFG0,  0x00);
+        cc1101WriteReg(CC1101_MCSM0,    0x18);
+        cc1101WriteReg(CC1101_FOCCFG,   0x16);
+        cc1101WriteReg(CC1101_BSCFG,    0x1C);
+        cc1101WriteReg(CC1101_AGCCTRL2, 0x03);
+        cc1101WriteReg(CC1101_AGCCTRL1, 0x00);
+        cc1101WriteReg(CC1101_AGCCTRL0, 0x40);
+        cc1101WriteReg(CC1101_FREND1,   0xB6);
+        cc1101WriteReg(CC1101_FREND0,   0x11);
+        cc1101WriteReg(CC1101_FSCAL3,   0xE9);
+        cc1101WriteReg(CC1101_FSCAL2,   0x2A);
+        cc1101WriteReg(CC1101_FSCAL1,   0x00);
+        cc1101WriteReg(CC1101_FSCAL0,   0x1F);
+        cc1101WriteReg(CC1101_FSTEST,   0x59);
+        cc1101WriteReg(CC1101_TEST2,    0x81);
+        cc1101WriteReg(CC1101_TEST1,    0x35);
+        cc1101WriteReg(CC1101_TEST0,    0x09);
+        uint8_t paTable[8] = {0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+        cc1101WriteRegBurst(CC1101_PATABLE, paTable, 8);
+        delay(2);
+    }
+
+    // 2. Seta frequência (chip deve estar em IDLE)
+    cc1101SetFrequency(freqHz);
+
+    // 3. Calibra o sintetizador VCO
+    cc1101SendCommand(CC1101_SCAL);
+    delay(2);  // SCAL demora ~720us
+    state = readMarcState();
+    Serial.printf("[CC1101] GoRx: pos-SCAL state=0x%02X\n", state);
+
+    // 4. Entra em RX
+    cc1101SendCommand(CC1101_SRX);
+    delay(5);  // Espera transição IDLE → RX (~900us + cal auto)
+    state = readMarcState();
+
+    // 5. Verifica se está em RX (0x0D) ou transitando para RX
+    // Estados válidos durante transição: 0x06(VCOON), 0x07(REGON), 0x0A(FS_LOCK), 0x0B(IFADCON), 0x0D(RX)
+    if (state == 0x0D) {
+        Serial.printf("[CC1101] GoRx: RX OK @ %lu Hz\n", freqHz);
+        return true;
+    }
+    if (state == 0x01) {
+        // Voltou para IDLE — tenta SRX de novo
+        Serial.printf("[CC1101] GoRx: voltou p/ IDLE, retentando SRX...\n");
+        cc1101SendCommand(CC1101_SRX);
+        delay(10);
+        state = readMarcState();
+        if (state == 0x0D) {
+            Serial.printf("[CC1101] GoRx: RX OK na 2a tentativa\n");
+            return true;
+        }
+    }
+    Serial.printf("[CC1101] GoRx: FALHOU, state final=0x%02X\n", state);
+    return false;
+}
+
+// ============================================================
 // CAPTURE - Copiar Sinal
 // ============================================================
 void cc1101StartCapture() {
@@ -484,23 +568,25 @@ void cc1101StartCapture() {
     isr_count = 0;
     capture_started = false;
 
-    // IOCFG0=0x0D = async serial output (os dados OOK saem direto no GDO0)
+    // Configura GDO0 para async serial data output
+    cc1101SendCommand(CC1101_SIDLE);
+    delay(1);
     cc1101WriteReg(CC1101_IOCFG0, 0x0D);
     pinMode(CC1101_GDO0, INPUT_PULLUP);
 
-    cc1101SetFrequency(currentCapture.frequency);
-    // Sequência do datasheet TI: SIDLE → SCAL → SRX
-    cc1101SendCommand(CC1101_SIDLE); delay(2);
-    cc1101SendCommand(CC1101_SCAL);  delay(2);
-    cc1101SendCommand(CC1101_SRX);   delay(5);
+    // Entra em RX com verificação de estado
+    bool rxOk = cc1101GoRx(currentCapture.frequency);
+    if (!rxOk) {
+        Serial.println("[CC1101] WARN: Falha ao entrar em RX, tentando continuar...");
+    }
 
     // Habilita ISR desde o início (HOPPING state)
     isr_last_val = digitalRead(CC1101_GDO0);
     isr_last_change = micros();
     isr_enabled = true;
 
-    Serial.printf("[CC1101] Capture iniciada @ %lu Hz, MARCSTATE=0x%02X\n",
-        currentCapture.frequency, cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F);
+    Serial.printf("[CC1101] Capture iniciada @ %lu Hz, MARCSTATE=0x%02X, GDO0=%d\n",
+        currentCapture.frequency, readMarcState(), digitalRead(CC1101_GDO0));
     Serial.flush();
 }
 
@@ -508,6 +594,22 @@ void cc1101CaptureLoop() {
     if (!cc1101CopyActive) return;
     unsigned long now = micros();
     unsigned long nowMs = millis();
+
+    // Verificação periódica: chip ainda está em RX?
+    static unsigned long lastStateCheck = 0;
+    if (nowMs - lastStateCheck > 2000) {
+        lastStateCheck = nowMs;
+        uint8_t ms = readMarcState();
+        if (ms != 0x0D && ms != 0x0E && ms != 0x0F) {
+            // Não está em RX/RX_END/RX_RST — reentra
+            Serial.printf("[CC1101] CAPLOOP: estado errado 0x%02X, reentrando RX\n", ms);
+            isr_enabled = false;
+            cc1101GoRx(currentCapture.frequency);
+            isr_last_val = digitalRead(CC1101_GDO0);
+            isr_last_change = micros();
+            isr_enabled = true;
+        }
+    }
 
     if (capture_state == STATE_HOPPING) {
         // Se ISR capturou >5 transições em pouco tempo, há sinal real
@@ -521,10 +623,7 @@ void cc1101CaptureLoop() {
             capture_started = false;
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
-            cc1101SetFrequency(currentCapture.frequency);
-            cc1101SendCommand(CC1101_SIDLE); delay(2);
-            cc1101SendCommand(CC1101_SCAL);  delay(2);
-            cc1101SendCommand(CC1101_SRX);   delay(5);
+            cc1101GoRx(currentCapture.frequency);
             isr_last_val = digitalRead(CC1101_GDO0);
             isr_last_change = micros();
             isr_enabled = true;
@@ -555,10 +654,7 @@ void cc1101CaptureLoop() {
             isr_last_change = micros();
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
-            cc1101SetFrequency(currentCapture.frequency);
-            cc1101SendCommand(CC1101_SIDLE); delay(2);
-            cc1101SendCommand(CC1101_SCAL);  delay(2);
-            cc1101SendCommand(CC1101_SRX);   delay(5);
+            cc1101GoRx(currentCapture.frequency);
             isr_last_val = digitalRead(CC1101_GDO0);
             isr_last_change = micros();
             isr_enabled = true;
@@ -610,10 +706,7 @@ void cc1101CaptureLoop() {
             currentFreqIndex = 0;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             lastFreqSwitch = millis();
-            cc1101SetFrequency(currentCapture.frequency);
-            cc1101SendCommand(CC1101_SIDLE); delay(2);
-            cc1101SendCommand(CC1101_SCAL);  delay(2);
-            cc1101SendCommand(CC1101_SRX);   delay(5);
+            cc1101GoRx(currentCapture.frequency);
             isr_last_val = digitalRead(CC1101_GDO0);
             isr_last_change = micros();
             isr_enabled = true;
