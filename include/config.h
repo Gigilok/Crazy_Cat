@@ -211,4 +211,13 @@ extern void cc1101SetFrequency(uint32_t freqHz);
 extern void cc1101WriteReg(uint8_t reg, uint8_t value);
 extern void cc1101SendCommand(uint8_t cmd);
 
+// ============================================================
+// SLEEP / WAKE — Isolamento de módulos
+// Modulos dormem após init e só acordam sob demanda
+// ============================================================
+extern void nrf24Sleep();
+extern void nrf24Wake();
+extern void cc1101Sleep();
+extern bool cc1101Wake();
+
 #endif
