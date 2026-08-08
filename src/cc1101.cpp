@@ -301,6 +301,9 @@ void cc1101SetFrequency(uint32_t freqHz) {
     cc1101WriteReg(CC1101_FREQ0, freqWord & 0xFF);
 }
 
+// Forward declaration — definida em cc1101CalibrateBand() abaixo (linha ~539)
+static void cc1101CalibrateBand(float freqMHz);
+
 static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
     cc1101SendCommand(CC1101_SIDLE);
