@@ -343,71 +343,44 @@ static bool cc1101Reset() {
 }
 
 // ============================================================
-// CONFIGURAÇÃO DOS REGISTRADORES (extraída de cc1101Init)
-// Valores baseados em Flipper Zero (ook_270khz_async) + ELECHOUSE
+// CONFIGURAÇÃO — PRESET EXATO DO FLIPPER ZERO (ook_270khz_async)
+// NÃO escreve FSCAL3/2/1/0, FSTEST, TEST2/1/0, PKTCTRL1, DEVIATN, BSCFG
+// Esses registradores usam os defaults do reset.
+// A calibração do VCO preenche FSCAL2/FSCAL3 automaticamente.
+// VALORES ESCRITOS ANTES DA CALIBRAÇÃO EM FSCAL/FSTEST PODEM IMPEDIR
+// O VCO DE CALIBRAR → chip vai para SLEEP (estado 0x00)!
 // ============================================================
 static void cc1101ConfigureRegs() {
-    // GDO0: async serial data output (dados OOK saem direto no GDO0)
-    cc1101WriteReg(CC1101_IOCFG0,   0x0D);
-
-    // FIFO: ADC retention + threshold adequado
-    cc1101WriteReg(CC1101_FIFOTHR,  0x47);
-
-    // IF Frequency: OBRIGATÓRIO (faltava no original)
-    cc1101WriteReg(CC1101_FSCTRL1,  0x06);
-
-    // Modo de pacote: async serial, sem CRC, sem whitening
-    cc1101WriteReg(CC1101_PKTCTRL0, 0x32);
-    cc1101WriteReg(CC1101_PKTCTRL1, 0x04);
-    cc1101WriteReg(CC1101_ADDR,     0x00);  // Sem filtro de endereço
-    cc1101WriteReg(CC1101_PKTLEN,  0x00);  // Tamanho variável (async mode)
-    cc1101WriteReg(CC1101_CHANNR,  0x00);  // Canal 0
-
-    // Modulação OOK/ASK
-    cc1101WriteReg(CC1101_MDMCFG4,  0x67);
-    cc1101WriteReg(CC1101_MDMCFG3,  0x32);
-    cc1101WriteReg(CC1101_MDMCFG2,  0x30);
-    cc1101WriteReg(CC1101_MDMCFG1,  0x00);
-    cc1101WriteReg(CC1101_MDMCFG0,  0x00);
-
-    // Deviation (irrelevante para OOK)
-    cc1101WriteReg(CC1101_DEVIATN,  0x15);
-
-    // Controle de máquina de estados
-    cc1101WriteReg(CC1101_MCSM0,    0x18);
-
-    // Frequency offset compensation
-    cc1101WriteReg(CC1101_FOCCFG,   0x16);
-
-    // Bit synchronization
-    cc1101WriteReg(CC1101_BSCFG,    0x1C);
-
-    // AGC: valores do Flipper Zero
-    cc1101WriteReg(CC1101_AGCCTRL2, 0x03);
-    cc1101WriteReg(CC1101_AGCCTRL1, 0x00);
-    cc1101WriteReg(CC1101_AGCCTRL0, 0x40);
-
-    // Front-end analógico RX/TX
-    cc1101WriteReg(CC1101_FREND1,   0xB6);
-    cc1101WriteReg(CC1101_FREND0,   0x11);
-
-    // Calibração do sintetizador de frequência
-    cc1101WriteReg(CC1101_FSCAL3,   0xE9);
-    cc1101WriteReg(CC1101_FSCAL2,   0x2A);
-    cc1101WriteReg(CC1101_FSCAL1,   0x00);
-    cc1101WriteReg(CC1101_FSCAL0,   0x1F);
-
-    // Teste de produção
-    cc1101WriteReg(CC1101_FSTEST,   0x59);
-
-    // Test registers
-    cc1101WriteReg(CC1101_TEST2,    0x81);
-    cc1101WriteReg(CC1101_TEST1,    0x35);
-    cc1101WriteReg(CC1101_TEST0,    0x09);
+    // Flipper preset — mesma ordem e mesmos valores
+    cc1101WriteReg(CC1101_IOCFG0,   0x0D);  // GDO0 = serial data output
+    cc1101WriteReg(CC1101_FIFOTHR,  0x47);  // ADC retention + threshold
+    cc1101WriteReg(CC1101_PKTCTRL0, 0x32);  // Async serial, sem CRC
+    cc1101WriteReg(CC1101_FSCTRL1,  0x06);  // IF frequency
+    cc1101WriteReg(CC1101_MDMCFG0,  0x00);  // Channel spacing
+    cc1101WriteReg(CC1101_MDMCFG1,  0x00);  // Channel spacing
+    cc1101WriteReg(CC1101_MDMCFG2,  0x30);  // ASK/OOK
+    cc1101WriteReg(CC1101_MDMCFG3,  0x32);  // Data rate
+    cc1101WriteReg(CC1101_MDMCFG4,  0x67);  // RX BW = 270kHz
+    cc1101WriteReg(CC1101_MCSM0,    0x18);  // Auto-cal + XOSC on
+    cc1101WriteReg(CC1101_FOCCFG,   0x18);  // Freq offset (Flipper value)
+    cc1101WriteReg(CC1101_AGCCTRL2, 0x03);  // AGC mag target
+    cc1101WriteReg(CC1101_AGCCTRL1, 0x00);  // AGC
+    cc1101WriteReg(CC1101_AGCCTRL0, 0x40);  // AGC boundary
+    cc1101WriteReg(CC1101_WORCTRL,  0xFB);  // WOR control
+    cc1101WriteReg(CC1101_FREND0,   0x11);  // Front-end TX
+    cc1101WriteReg(CC1101_FREND1,   0xB6);  // Front-end RX
 
     // PATABLE — OOK: PA[0]=0x00 (OFF), PA[1]=0xC0 (ON)
     uint8_t paTable[8] = {0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     cc1101WriteRegBurst(CC1101_PATABLE, paTable, 8);
+
+    // DIAGNÓSTICO: ler FSCAL2/FSCAL3 depois da config (devem ser defaults do reset)
+    uint8_t fs3 = cc1101ReadReg(CC1101_FSCAL3);
+    uint8_t fs2 = cc1101ReadReg(CC1101_FSCAL2);
+    uint8_t fs0 = cc1101ReadReg(CC1101_FSCAL0);
+    uint8_t ft  = cc1101ReadReg(CC1101_FSTEST);
+    Serial.printf("[CC1101] CONFIG: FSCAL3=0x%02X FSCAL2=0x%02X FSCAL0=0x%02X FSTEST=0x%02X\n",
+        fs3, fs2, fs0, ft);
 }
 
 // ============================================================
@@ -549,121 +522,81 @@ static uint8_t readMarcStateRaw() {
 
 static bool cc1101GoRx(uint32_t freqHz) {
     uint8_t state, raw;
-    
-    // === DIAGNÓSTICO PASSO-A-PASSO ===
-    // Cada passo lê MARCSTATE para descobrir ONDE o chip vai para SLEEP
-    
-    // PASSO 0: Estado antes de qualquer coisa
+
+    // === SEQUÊNCIA EXATA DO FLIPPER ZERO ===
+    // 1. Set frequency
+    // 2. SCAL (calibra VCO)
+    // 3. Espera calibração terminar (volta a IDLE)
+    // 4. SFRX (flush RX FIFO)
+    // 5. SRX (entra em RX)
+
+    // PASSO 0: Estado inicial
     raw = readMarcStateRaw();
     state = raw & 0x1F;
-    Serial.printf("[CC1101] GoRx STEP0: raw=0x%02X state=0x%02X MISO=%d\n", 
-        raw, state, digitalRead(CC1101_MISO));
-    
+    Serial.printf("[CC1101] GoRx STEP0: raw=0x%02X state=0x%02X\n", raw, state);
     if (state != 0x01) {
-        Serial.printf("[CC1101] GoRx: ERRO - chip nao esta em IDLE (0x%02X)!\n", state);
+        Serial.printf("[CC1101] GoRx: ERRO - nao esta em IDLE (0x%02X)!\n", state);
         return false;
     }
-    
-    // PASSO 1: Seta frequência e verifica SPI lendo de volta
+
+    // PASSO 1: Seta frequência
     cc1101SetFrequency(freqHz);
-    uint8_t freq2back = cc1101ReadReg(CC1101_FREQ2);
-    uint32_t freqWord = (uint32_t)((freqHz / 26000000.0) * 65536);
-    uint8_t freq2expect = (freqWord >> 16) & 0xFF;
-    Serial.printf("[CC1101] GoRx STEP1: FREQ2=0x%02X (expect 0x%02X) SPI=%s\n", 
-        freq2back, freq2expect, freq2back == freq2expect ? "OK" : "FAIL!");
-    
-    // PASSO 2: Estado após setFrequency
-    raw = readMarcStateRaw();
-    state = raw & 0x1F;
-    Serial.printf("[CC1101] GoRx STEP2: pos-setFreq raw=0x%02X state=0x%02X\n", raw, state);
-    if (state != 0x01) {
-        Serial.printf("[CC1101] GoRx: FALHA - setFrequency mudou estado para 0x%02X!\n", state);
-    }
-    
-    // PASSO 3: Envia SIDLE
-    cc1101SendCommand(CC1101_SIDLE);
-    
-    // PASSO 4: Estado após SIDLE
-    raw = readMarcStateRaw();
-    state = raw & 0x1F;
-    Serial.printf("[CC1101] GoRx STEP3: pos-SIDLE raw=0x%02X state=0x%02X MISO=%d\n", 
-        raw, state, digitalRead(CC1101_MISO));
-    if (state != 0x01) {
-        Serial.printf("[CC1101] GoRx: FALHA - SIDLE mudou estado para 0x%02X!\n", state);
-        // Tenta recovery com SIDLE de novo
-        cc1101SendCommand(CC1101_SIDLE);
-        delay(2);
+
+    // PASSO 2: SCAL — calibra o sintetizador de frequência
+    Serial.printf("[CC1101] GoRx: enviando SCAL...\n");
+    cc1101SendCommand(CC1101_SCAL);
+
+    // PASSO 3: Espera calibração terminar — deve voltar a IDLE (0x01)
+    uint32_t t0 = millis();
+    while (millis() - t0 < 200) {
         raw = readMarcStateRaw();
         state = raw & 0x1F;
-        Serial.printf("[CC1101] GoRx STEP3b: pos-recovery raw=0x%02X state=0x%02X\n", raw, state);
+        if (state == 0x01) break;
+        if (state == 0x00) {
+            Serial.printf("[CC1101] GoRx: SCAL falhou - chip em SLEEP!\n");
+            return false;
+        }
+        delayMicroseconds(500);
     }
-    
-    // PASSO 5: Envia SRX
+    Serial.printf("[CC1101] GoRx STEP1: pos-SCAL raw=0x%02X state=0x%02X (%lums)\n",
+        raw, state, millis() - t0);
+
+    if (state != 0x01) {
+        Serial.printf("[CC1101] GoRx: FALHA - calibracao nao completou (state=0x%02X)\n", state);
+        return false;
+    }
+
+    // Lê FSCAL2/FSCAL3 para verificar que a calibração escreveu novos valores
+    uint8_t fs3 = cc1101ReadReg(CC1101_FSCAL3);
+    uint8_t fs2 = cc1101ReadReg(CC1101_FSCAL2);
+    Serial.printf("[CC1101] GoRx: pos-cal FSCAL3=0x%02X FSCAL2=0x%02X\n", fs3, fs2);
+
+    // PASSO 4: SFRX — flush RX FIFO (Flipper faz isso)
+    cc1101SendCommand(CC1101_SFRX);
+
+    // PASSO 5: SRX — entra em RX
     cc1101SendCommand(CC1101_SRX);
-    
-    // PASSO 6: Estado IMEDIATO após SRX (sem delay nenhum)
-    raw = readMarcStateRaw();
-    state = raw & 0x1F;
-    Serial.printf("[CC1101] GoRx STEP4: pos-SRX(0ms) raw=0x%02X state=0x%02X MISO=%d\n", 
-        raw, state, digitalRead(CC1101_MISO));
-    
-    // PASSO 7: Estado após 2ms
-    delay(2);
-    raw = readMarcStateRaw();
-    state = raw & 0x1F;
-    Serial.printf("[CC1101] GoRx STEP5: pos-SRX(2ms) raw=0x%02X state=0x%02X MISO=%d\n", 
-        raw, state, digitalRead(CC1101_MISO));
-    
-    // PASSO 8: Estado após 10ms
-    delay(8);
-    raw = readMarcStateRaw();
-    state = raw & 0x1F;
-    Serial.printf("[CC1101] GoRx STEP6: pos-SRX(10ms) raw=0x%02X state=0x%02X MISO=%d\n", 
-        raw, state, digitalRead(CC1101_MISO));
-    
+
+    // PASSO 6: Espera entrar em RX
+    t0 = millis();
+    while (millis() - t0 < 200) {
+        raw = readMarcStateRaw();
+        state = raw & 0x1F;
+        if (state == 0x0D || state == 0x0E || state == 0x0F) break;
+        if (state == 0x00) {
+            Serial.printf("[CC1101] GoRx: SRX falhou - chip em SLEEP!\n");
+            return false;
+        }
+        delayMicroseconds(500);
+    }
+    Serial.printf("[CC1101] GoRx STEP2: pos-SRX raw=0x%02X state=0x%02X (%lums)\n",
+        raw, state, millis() - t0);
+
     if (state == 0x0D || state == 0x0E || state == 0x0F) {
         Serial.printf("[CC1101] GoRx: RX OK @ %lu Hz\n", freqHz);
         return true;
     }
-    
-    // FALLBACK: Reset completo + reconfig + tentativa Flipper-style
-    Serial.printf("[CC1101] GoRx: fallback - reset completo...\n");
-    if (!cc1101Reset()) return false;
-    cc1101ConfigureRegs();
-    delay(2);
-    
-    // Flipper-style: set freq → SCAL → wait IDLE → SFRX → SRX
-    cc1101SetFrequency(freqHz);
-    cc1101SendCommand(CC1101_SCAL);
-    
-    // Espera calibração terminar (chip volta a IDLE)
-    uint32_t t0 = millis();
-    do {
-        raw = readMarcStateRaw();
-        state = raw & 0x1F;
-        if (state == 0x01) break;
-        delay(1);
-    } while (millis() - t0 < 100);
-    Serial.printf("[CC1101] GoRx STEP7: pos-SCAL raw=0x%02X state=0x%02X (%lums)\n", 
-        raw, state, millis() - t0);
-    
-    // SFRX - flush FIFO (Flipper faz isso)
-    cc1101SendCommand(CC1101_SFRX);
-    delay(1);
-    
-    // SRX
-    cc1101SendCommand(CC1101_SRX);
-    delay(5);
-    
-    raw = readMarcStateRaw();
-    state = raw & 0x1F;
-    Serial.printf("[CC1101] GoRx STEP8: pos-flipper-RX raw=0x%02X state=0x%02X\n", raw, state);
-    
-    if (state == 0x0D || state == 0x0E || state == 0x0F) {
-        Serial.printf("[CC1101] GoRx: RX OK (flipper-style) @ %lu Hz\n", freqHz);
-        return true;
-    }
-    
+
     Serial.printf("[CC1101] GoRx: FALHOU, state final=0x%02X\n", state);
     return false;
 }
