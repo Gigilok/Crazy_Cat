@@ -8,6 +8,7 @@
 //   - ELECHOUSE_cc1101 (SmartRC-CC1101-Driver-Lib) V3.0.2
 //   - Flipper Zero firmware (subghz_device_cc1101_preset_ook_270khz_async)
 //   - DIV (Cifertech) — usa ELECHOUSE internamente
+//   - CC1101 Datasheet SWRS061C (Texas Instruments)
 //
 // PADRÃO SPI CORRETO (usado por TODOS os projetos funcionais):
 //   1. beginTransaction()
@@ -24,26 +25,43 @@
 //   - waitMisoReady() tinha timeout de 5ms (agora 200ms como ELECHOUSE)
 //   - Retorno de waitMisoReady() era ignorado (agora verificado)
 //   - SPI a 1MHz (agora 4MHz)
-//   - FSCTRL1 não era escrito (IF freq errada)
 //   - FREND1 não era escrito (front-end analógico errado)
 //   - PATABLE todo 0xC0 (OOK sem modulação)
 //   - AGCCTRL2/0 com valores subótimos
 //   - MDMCFG4 banda muito larga (812kHz → 270kHz)
 //   - cc1101Reset(): endTransaction() ANTES de CSN HIGH (corrompia SRES)
 //   - Módulos NRF24/CC1101 ativos simultaneamente (interferência SPI)
+//   - *** ENDEREÇOS DE REGISTRADORES ERRADOS ***
+//     FSCTRL1 era 0x07 (FIFOTHR!), correto é 0x0B
+//     PKTCTRL1 era 0x09 (ADDR!), correto é 0x07
+//     → Isso fazia escrever nos registradores ERRADOS, destruindo a config
+//     → O chip nunca conseguia entrar em RX por causa disso
 // ============================================================
 
 SPIClass spiCC1101(HSPI);
 
 // ============================================================
-// Registradores do CC1101
+// ENDEREÇOS DE REGISTRADORES — verificados contra datasheet SWRS061C
+// e contra cc1101_regs.h do Flipper Zero. NÃO mudar sem verificar!
+// Mapa: 0x00=IOCFG2  0x02=IOCFG0  0x03=FIFOTHR  0x06=PKTLEN
+//   0x07=PKTCTRL1  0x08=PKTCTRL0  0x09=ADDR  0x0A=CHANNR
+//   0x0B=FSCTRL1  0x0C=FSCTRL0  0x0D=FREQ2  0x0E=FREQ1  0x0F=FREQ0
+//   0x10=MDMCFG4  0x11=MDMCFG3  0x12=MDMCFG2  0x13=MDMCFG1  0x14=MDMCFG0
+//   0x15=DEVIATN  0x18=MCSM0  0x19=FOCCFG  0x1A=BSCFG
+//   0x1B=AGCCTRL2  0x1C=AGCCTRL1  0x1D=AGCCTRL0
+//   0x20=WORCTRL  0x21=FREND1  0x22=FREND0
+//   0x23=FSCAL3  0x24=FSCAL2  0x25=FSCAL1  0x26=FSCAL0
+//   0x29=FSTEST  0x2C=TEST2  0x2D=TEST1  0x2E=TEST0
 // ============================================================
-#define CC1101_IOCFG2   0x00
-#define CC1101_IOCFG0   0x02
-#define CC1101_FIFOTHR  0x03
-#define CC1101_FSCTRL1  0x07
-#define CC1101_PKTCTRL0 0x08
-#define CC1101_PKTCTRL1 0x09
+#define CC1101_IOCFG2   0x00  // GDO2 output pin configuration
+#define CC1101_IOCFG0   0x02  // GDO0 output pin configuration
+#define CC1101_FIFOTHR  0x03  // RX FIFO and TX FIFO thresholds
+#define CC1101_FSCTRL1  0x0B  // Frequency synthesizer control (ERRO: era 0x07!)
+#define CC1101_PKTCTRL1 0x07  // Packet automation control (ERRO: era 0x09!)
+#define CC1101_PKTCTRL0 0x08  // Packet automation control
+#define CC1101_ADDR     0x09  // Device address (antes confundido com PKTCTRL1)
+#define CC1101_CHANNR   0x0A  // Channel number
+#define CC1101_PKTLEN   0x06  // Packet length
 #define CC1101_FREQ2    0x0D
 #define CC1101_FREQ1    0x0E
 #define CC1101_FREQ0    0x0F
@@ -65,15 +83,15 @@ SPIClass spiCC1101(HSPI);
 #define CC1101_FSCAL2   0x24
 #define CC1101_FSCAL1   0x25
 #define CC1101_FSCAL0   0x26
-#define CC1101_FSTEST   0x2B
-#define CC1101_TEST2    0x2C
-#define CC1101_TEST1    0x2D
-#define CC1101_TEST0    0x2E
-#define CC1101_PARTNUM  0x30
-#define CC1101_VERSION  0x31
-#define CC1101_RSSI     0x34
-#define CC1101_MARCSTATE 0x35
-#define CC1101_WORCTRL  0x20
+#define CC1101_WORCTRL  0x20  // Wake On Radio control
+#define CC1101_FSTEST   0x29  // Frequency synthesizer test (ERRO: era 0x2B!)
+#define CC1101_TEST2    0x2C  // Various test settings
+#define CC1101_TEST1    0x2D  // Various test settings
+#define CC1101_TEST0    0x2E  // Various test settings
+#define CC1101_PARTNUM  0x30  // Part number (status: 0x00 = CC1101)
+#define CC1101_VERSION  0x31  // Chip version (status: 0x14 = Rev C)
+#define CC1101_RSSI     0x34  // RSSI status register (0x34 = RSSI, 0x35/0x36 = MARCSTATE)
+#define CC1101_MARCSTATE 0x35  // Main radio control state machine status
 
 #define CC1101_SRES     0x30
 #define CC1101_SCAL     0x33
@@ -341,6 +359,9 @@ static void cc1101ConfigureRegs() {
     // Modo de pacote: async serial, sem CRC, sem whitening
     cc1101WriteReg(CC1101_PKTCTRL0, 0x32);
     cc1101WriteReg(CC1101_PKTCTRL1, 0x04);
+    cc1101WriteReg(CC1101_ADDR,     0x00);  // Sem filtro de endereço
+    cc1101WriteReg(CC1101_PKTLEN,  0x00);  // Tamanho variável (async mode)
+    cc1101WriteReg(CC1101_CHANNR,  0x00);  // Canal 0
 
     // Modulação OOK/ASK
     cc1101WriteReg(CC1101_MDMCFG4,  0x67);
@@ -522,35 +543,26 @@ static uint8_t readMarcState() {
 }
 
 static bool cc1101GoRx(uint32_t freqHz) {
-    // 1. Seta frequência (3 register writes)
+    // === PADRÃO ELECHOUSE (DIV usa exatamente isso): ===
+    // 1. cc1101SendCommand(SIDLE) — transação SPI separada
+    // 2. cc1101SendCommand(SRX)  — transação SPI separada
+    // Cada strobe é uma transação SPI completa com CSN toggle.
+    // MCSM0.FS_AUTOCAL=1 faz auto-calibration automaticamente na transição IDLE→RX.
+    // NÃO enviamos SCAL manual — igual DIV e Flipper.
+
+    // 1. Seta frequência
     cc1101SetFrequency(freqHz);
 
-    // 2. Entra em RX usando PADRÃO ELECHOUSE:
-    //    SIDLE + SRX na MESMA sessão CSN!
-    //    Sem SCAL — MCSM0.FS_AUTOCAL=1 faz auto-calibration IDLE→RX
-    spiCC1101.beginTransaction(CC1101_SPI_SETTINGS);
-    digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(20);
+    // 2. SIDLE — sai de qualquer estado, volta para IDLE
+    cc1101SendCommand(CC1101_SIDLE);
+    delayMicroseconds(100);
 
-    // Espera chip pronto (MISO LOW)
+    // 3. SRX — entra em RX (auto-calibration acontece aqui automaticamente)
+    cc1101SendCommand(CC1101_SRX);
+
+    // 4. Espera o chip terminar calibração e entrar em RX
+    //    (MISO sobe durante cal, volta LOW quando RX está pronto)
     uint32_t t0 = millis();
-    while (digitalRead(CC1101_MISO) != LOW) {
-        if (millis() - t0 > 200) {
-            Serial.println("[CC1101] GoRx: MISO timeout!");
-            digitalWrite(CC1101_CSN, HIGH);
-            delayMicroseconds(50);
-            spiCC1101.endTransaction();
-            return false;
-        }
-    }
-
-    // Envia SIDLE e SRX back-to-back (MESMA sessão CSN = padrão ELECHOUSE)
-    spiCC1101.transfer(CC1101_SIDLE);
-    delayMicroseconds(10);
-    spiCC1101.transfer(CC1101_SRX);
-
-    // Espera chip terminar calibração RX (MISO vai HIGH→LOW)
-    t0 = millis();
     while (digitalRead(CC1101_MISO) != LOW) {
         if (millis() - t0 > 500) {
             Serial.println("[CC1101] GoRx: timeout esperando RX ready");
@@ -558,53 +570,30 @@ static bool cc1101GoRx(uint32_t freqHz) {
         }
     }
 
-    // CSN HIGH antes de endTransaction (como no fix do reset)
-    digitalWrite(CC1101_CSN, HIGH);
-    delayMicroseconds(50);
-    spiCC1101.endTransaction();
-
-    // 3. Verifica estado
-    delay(2);
+    // 5. Verifica estado
+    delay(1);
     uint8_t state = readMarcState();
-    Serial.printf("[CC1101] GoRx: apos SIDLE+SRX, state=0x%02X @ %lu Hz\n", state, freqHz);
+    Serial.printf("[CC1101] GoRx: state=0x%02X @ %lu Hz\n", state, freqHz);
 
     if (state == 0x0D || state == 0x0E || state == 0x0F) {
-        Serial.printf("[CC1101] GoRx: RX OK @ %lu Hz\n", freqHz);
         return true;
     }
 
-    // 4. Fallback: reset completo + tente de novo
-    Serial.printf("[CC1101] GoRx: falhou (state=0x%02X), reset + retentativa...\n", state);
-    if (!cc1101Reset()) return false;
-    cc1101ConfigureRegs();
+    // 6. Fallback — tenta mais uma vez com SIDLE + SRX
+    Serial.printf("[CC1101] GoRx: falhou (state=0x%02X), retentativa...\n", state);
+    cc1101SendCommand(CC1101_SIDLE);
     delay(2);
-    cc1101SetFrequency(freqHz);
+    cc1101SendCommand(CC1101_SRX);
 
-    // Tenta SRX direto (sem SIDLE, chip deve estar em IDLE apos reset)
-    spiCC1101.beginTransaction(CC1101_SPI_SETTINGS);
-    digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(20);
-    t0 = millis();
-    while (digitalRead(CC1101_MISO) != LOW) {
-        if (millis() - t0 > 200) {
-            digitalWrite(CC1101_CSN, HIGH);
-            spiCC1101.endTransaction();
-            return false;
-        }
-    }
-    spiCC1101.transfer(CC1101_SRX);
     t0 = millis();
     while (digitalRead(CC1101_MISO) != LOW) {
         if (millis() - t0 > 500) break;
     }
-    digitalWrite(CC1101_CSN, HIGH);
-    delayMicroseconds(50);
-    spiCC1101.endTransaction();
 
     delay(2);
     state = readMarcState();
-    if (state == 0x0D) {
-        Serial.printf("[CC1101] GoRx: RX OK na 2a tentativa (reset)\n");
+    if (state == 0x0D || state == 0x0E || state == 0x0F) {
+        Serial.printf("[CC1101] GoRx: RX OK na 2a tentativa\n");
         return true;
     }
 
