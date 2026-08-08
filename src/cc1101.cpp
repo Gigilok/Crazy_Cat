@@ -36,6 +36,11 @@
 //     PKTCTRL1 era 0x09 (ADDR!), correto é 0x07
 //     → Isso fazia escrever nos registradores ERRADOS, destruindo a config
 //     → O chip nunca conseguia entrar em RX por causa disso
+//   - *** SCAL (0x33) faz o chip ir para SLEEP no ESP32 ***
+//     O Flipper Zero (STM32) usa SCAL sem problema, mas no ESP32
+//     o strobe SCAL faz o CC1101 ir de IDLE → SLEEP ao invés de IDLE → CALIBRATE.
+//     Solução: abordagem ELECHOUSE — escrever FSCTRL0/TEST0 por banda de
+//     frequência e ir direto SIDLE → SRX (sem SCAL).
 // ============================================================
 
 SPIClass spiCC1101(HSPI);
@@ -57,6 +62,7 @@ SPIClass spiCC1101(HSPI);
 #define CC1101_IOCFG0   0x02  // GDO0 output pin configuration
 #define CC1101_FIFOTHR  0x03  // RX FIFO and TX FIFO thresholds
 #define CC1101_FSCTRL1  0x0B  // Frequency synthesizer control (ERRO: era 0x07!)
+#define CC1101_FSCTRL0  0x0C  // Frequency synthesizer control
 #define CC1101_PKTCTRL1 0x07  // Packet automation control (ERRO: era 0x09!)
 #define CC1101_PKTCTRL0 0x08  // Packet automation control
 #define CC1101_ADDR     0x09  // Device address (antes confundido com PKTCTRL1)
@@ -296,11 +302,13 @@ void cc1101SetFrequency(uint32_t freqHz) {
 }
 
 static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
+    float freqMHz = freqHz / 1000000.0f;
     cc1101SendCommand(CC1101_SIDLE);
     delay(1);
     cc1101SetFrequency(freqHz);
-    cc1101SendCommand(CC1101_SCAL);
-    delay(2);
+    cc1101CalibrateBand(freqMHz);
+    // NÃO envia SCAL — no ESP32 o SCAL faz o chip ir para SLEEP.
+    // A calibração por banda (FSCTRL0/TEST0) é suficiente.
 }
 
 // ============================================================
@@ -520,79 +528,118 @@ static uint8_t readMarcStateRaw() {
     return cc1101ReadStatus(CC1101_MARCSTATE);
 }
 
+// ============================================================
+// CALIBRAÇÃO POR BANDA DE FREQUÊNCIA (estilo ELECHOUSE)
+// O SCAL (strobe de calibração) falha no ESP32 — o chip vai para SLEEP.
+// O ELECHOUSE (que funciona no ESP32) NUNCA envia SCAL.
+// Em vez disso, ele escreve FSCTRL0 e TEST0 baseado na banda de frequência,
+// e ajusta FSCAL2 se necessário. Depois vai direto SIDLE → SRX.
+// Isso funciona porque os valores de FSCTRL0/TEST0 guiam o VCO diretamente.
+// ============================================================
+static void cc1101CalibrateBand(float freqMHz) {
+    if (freqMHz >= 300.0f && freqMHz <= 348.0f) {
+        // Banda 315 MHz
+        int fsctrl0_val = (int)(24.0f + (freqMHz - 300.0f) / (348.0f - 300.0f) * (28.0f - 24.0f));
+        cc1101WriteReg(CC1101_FSCTRL0, (uint8_t)fsctrl0_val);
+        if (freqMHz < 322.88f) {
+            cc1101WriteReg(CC1101_TEST0, 0x0B);
+        } else {
+            cc1101WriteReg(CC1101_TEST0, 0x09);
+            uint8_t s = cc1101ReadReg(CC1101_FSCAL2);
+            if (s < 32) cc1101WriteReg(CC1101_FSCAL2, s + 32);
+        }
+    } else if (freqMHz >= 378.0f && freqMHz <= 464.0f) {
+        // Banda 433 MHz
+        int fsctrl0_val = (int)(31.0f + (freqMHz - 378.0f) / (464.0f - 378.0f) * (38.0f - 31.0f));
+        cc1101WriteReg(CC1101_FSCTRL0, (uint8_t)fsctrl0_val);
+        if (freqMHz < 430.5f) {
+            cc1101WriteReg(CC1101_TEST0, 0x0B);
+        } else {
+            cc1101WriteReg(CC1101_TEST0, 0x09);
+            uint8_t s = cc1101ReadReg(CC1101_FSCAL2);
+            if (s < 32) cc1101WriteReg(CC1101_FSCAL2, s + 32);
+        }
+    } else if (freqMHz >= 779.0f && freqMHz <= 899.99f) {
+        // Banda 868 MHz (baixa)
+        int fsctrl0_val = (int)(65.0f + (freqMHz - 779.0f) / (899.0f - 779.0f) * (76.0f - 65.0f));
+        cc1101WriteReg(CC1101_FSCTRL0, (uint8_t)fsctrl0_val);
+        if (freqMHz < 861.0f) {
+            cc1101WriteReg(CC1101_TEST0, 0x0B);
+        } else {
+            cc1101WriteReg(CC1101_TEST0, 0x09);
+            uint8_t s = cc1101ReadReg(CC1101_FSCAL2);
+            if (s < 32) cc1101WriteReg(CC1101_FSCAL2, s + 32);
+        }
+    } else if (freqMHz >= 900.0f && freqMHz <= 928.0f) {
+        // Banda 915 MHz
+        int fsctrl0_val = (int)(77.0f + (freqMHz - 900.0f) / (928.0f - 900.0f) * (79.0f - 77.0f));
+        cc1101WriteReg(CC1101_FSCTRL0, (uint8_t)fsctrl0_val);
+        cc1101WriteReg(CC1101_TEST0, 0x09);
+        uint8_t s = cc1101ReadReg(CC1101_FSCAL2);
+        if (s < 32) cc1101WriteReg(CC1101_FSCAL2, s + 32);
+    }
+}
+
 static bool cc1101GoRx(uint32_t freqHz) {
     uint8_t state, raw;
+    float freqMHz = freqHz / 1000000.0f;
 
-    // === SEQUÊNCIA EXATA DO FLIPPER ZERO ===
-    // 1. Set frequency
-    // 2. SCAL (calibra VCO)
-    // 3. Espera calibração terminar (volta a IDLE)
+    // === ABORDAGEM ELECHOUSE (provada no ESP32) ===
+    // O Flipper Zero usa SCAL, mas ele roda em STM32 com SPI hardware diferente.
+    // No ESP32, o SCAL faz o chip ir para SLEEP. O ELECHOUSE resolve isso
+    // escrevendo FSCTRL0/TEST0 por banda de frequência e indo direto SIDLE→SRX.
+    //
+    // Sequência:
+    // 1. Verifica estado IDLE
+    // 2. Seta frequência
+    // 3. Calibração por banda (FSCTRL0 + TEST0 + FSCAL2)
     // 4. SFRX (flush RX FIFO)
-    // 5. SRX (entra em RX)
+    // 5. SIDLE → SRX
 
     // PASSO 0: Estado inicial
     raw = readMarcStateRaw();
     state = raw & 0x1F;
-    Serial.printf("[CC1101] GoRx STEP0: raw=0x%02X state=0x%02X\n", raw, state);
     if (state != 0x01) {
-        Serial.printf("[CC1101] GoRx: ERRO - nao esta em IDLE (0x%02X)!\n", state);
-        return false;
+        Serial.printf("[CC1101] GoRx: nao esta em IDLE (0x%02X), enviando SIDLE...\n", state);
+        cc1101SendCommand(CC1101_SIDLE);
+        delay(2);
+        raw = readMarcStateRaw();
+        state = raw & 0x1F;
+        if (state != 0x01) {
+            Serial.printf("[CC1101] GoRx: FALHA - nao conseguiu ir para IDLE (state=0x%02X)\n", state);
+            return false;
+        }
     }
 
     // PASSO 1: Seta frequência
     cc1101SetFrequency(freqHz);
 
-    // PASSO 2: SCAL — calibra o sintetizador de frequência
-    Serial.printf("[CC1101] GoRx: enviando SCAL...\n");
-    cc1101SendCommand(CC1101_SCAL);
+    // PASSO 2: Calibração por banda (estilo ELECHOUSE)
+    cc1101CalibrateBand(freqMHz);
 
-    // PASSO 3: Espera calibração terminar — deve voltar a IDLE (0x01)
-    uint32_t t0 = millis();
-    while (millis() - t0 < 200) {
-        raw = readMarcStateRaw();
-        state = raw & 0x1F;
-        if (state == 0x01) break;
-        if (state == 0x00) {
-            Serial.printf("[CC1101] GoRx: SCAL falhou - chip em SLEEP!\n");
-            return false;
-        }
-        delayMicroseconds(500);
-    }
-    Serial.printf("[CC1101] GoRx STEP1: pos-SCAL raw=0x%02X state=0x%02X (%lums)\n",
-        raw, state, millis() - t0);
-
-    if (state != 0x01) {
-        Serial.printf("[CC1101] GoRx: FALHA - calibracao nao completou (state=0x%02X)\n", state);
-        return false;
-    }
-
-    // Lê FSCAL2/FSCAL3 para verificar que a calibração escreveu novos valores
-    uint8_t fs3 = cc1101ReadReg(CC1101_FSCAL3);
-    uint8_t fs2 = cc1101ReadReg(CC1101_FSCAL2);
-    Serial.printf("[CC1101] GoRx: pos-cal FSCAL3=0x%02X FSCAL2=0x%02X\n", fs3, fs2);
-
-    // PASSO 4: SFRX — flush RX FIFO (Flipper faz isso)
+    // PASSO 3: SFRX — flush RX FIFO
     cc1101SendCommand(CC1101_SFRX);
 
-    // PASSO 5: SRX — entra em RX
+    // PASSO 4: SRX — entra em RX (igual ELECHOUSE: SIDLE → SRX)
+    cc1101SendCommand(CC1101_SIDLE);
     cc1101SendCommand(CC1101_SRX);
 
-    // PASSO 6: Espera entrar em RX
-    t0 = millis();
-    while (millis() - t0 < 200) {
+    // PASSO 5: Espera entrar em RX
+    uint32_t t0 = millis();
+    while (millis() - t0 < 500) {
         raw = readMarcStateRaw();
         state = raw & 0x1F;
-        if (state == 0x0D || state == 0x0E || state == 0x0F) break;
+        if (state == 0x06 || state == 0x0D || state == 0x0E || state == 0x0F) break;
         if (state == 0x00) {
-            Serial.printf("[CC1101] GoRx: SRX falhou - chip em SLEEP!\n");
+            Serial.printf("[CC1101] GoRx: chip em SLEEP apos SRX!\n");
             return false;
         }
         delayMicroseconds(500);
     }
-    Serial.printf("[CC1101] GoRx STEP2: pos-SRX raw=0x%02X state=0x%02X (%lums)\n",
+    Serial.printf("[CC1101] GoRx: pos-SRX raw=0x%02X state=0x%02X (%lums)\n",
         raw, state, millis() - t0);
 
-    if (state == 0x0D || state == 0x0E || state == 0x0F) {
+    if (state == 0x06 || state == 0x0D || state == 0x0E || state == 0x0F) {
         Serial.printf("[CC1101] GoRx: RX OK @ %lu Hz\n", freqHz);
         return true;
     }
