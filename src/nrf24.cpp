@@ -4,6 +4,9 @@
 
 RF24 radio(NRF_CE, NRF_CSN);
 
+// Flag para saber se o módulo NRF24 está ativo ou em sleep
+static bool nrf24Awake = false;
+
 struct NRFDevice {
     uint8_t address[5];
     uint8_t channel;
@@ -117,11 +120,56 @@ bool nrf24Init() {
     radio.openReadingPipe(1, dummyAddress);
     Serial.println(F("[NRF24] Configurado com sucesso!"));
     Serial.flush();
+
+    // Coloca em sleep imediatamente — só acorda quando entrar em função NRF
+    nrf24Sleep();
     return true;
+}
+
+// ============================================================
+// SLEEP / WAKE — Isolamento do módulo NRF24
+// O módulo só fica ativo quando uma função NRF está em uso.
+// Isso evita interferência SPI com o CC1101.
+// ============================================================
+void nrf24Sleep() {
+    radio.powerDown();
+    digitalWrite(NRF_CE, LOW);
+    nrf24Awake = false;
+    Serial.println(F("[NRF24] Modulo em SLEEP (desativado)"));
+}
+
+void nrf24Wake() {
+    if (nrf24Awake) return;
+    Serial.println(F("[NRF24] WAKE: acordando modulo..."));
+    Serial.flush();
+    
+    // Se o chip não está conectado, tenta re-init completo
+    if (!radio.isChipConnected()) {
+        Serial.println(F("[NRF24] WAKE: chip desconectado, re-inicializando..."));
+        SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN);
+        if (!radio.begin()) {
+            Serial.println(F("[NRF24] WAKE: re-init falhou!"));
+            return;
+        }
+        radio.setPALevel(RF24_PA_MAX, true);
+        radio.setDataRate(RF24_1MBPS);
+        radio.setAutoAck(false);
+        radio.disableCRC();
+        radio.setRetries(0, 0);
+        radio.setCRCLength(RF24_CRC_DISABLED);
+        radio.openReadingPipe(1, dummyAddress);
+    } else {
+        radio.powerUp();
+        delay(5); // Espera crystal do NRF24 estabilizar (datasheet: 1.5ms)
+    }
+    nrf24Awake = true;
+    Serial.println(F("[NRF24] WAKE: modulo pronto"));
+    Serial.flush();
 }
 
 // SCANNER ANTIGO
 void nrf24StartScan() {
+    nrf24Wake();
     scanning = true;
     scanIndex = 0;
     scanTotalPackets = 0;
@@ -133,7 +181,11 @@ void nrf24StartScan() {
     radio.setDataRate(RF24_1MBPS);
     radio.openReadingPipe(1, dummyAddress);
 }
-void nrf24StopScan() { scanning = false; radio.stopListening(); }
+void nrf24StopScan() {
+    scanning = false;
+    radio.stopListening();
+    nrf24Sleep();
+}
 bool nrf24IsScanning() { return scanning; }
 const int8_t* nrf24GetScanHistory() { return scanHistory; }
 int nrf24GetScanIndex() { return scanIndex; }
@@ -171,6 +223,7 @@ void nrf24ScanLoop() {
 // ANALYZER (SNIFFER NÃO-BLOQUEANTE CORRIGIDO)
 // ============================================================
 void nrf24StartAnalyze() {
+    nrf24Wake();
     analyzing = true;
     detectedCount = 0;
     analyzeSelectedIndex = 0;
@@ -230,6 +283,7 @@ void nrf24AnalyzeTick() {
 void nrf24StopAnalyze() {
     analyzing = false;
     radio.stopListening();
+    nrf24Sleep();
 }
 
 bool nrf24IsAnalyzing() { return analyzing; }
@@ -322,6 +376,7 @@ void nrf24SpecScan() {
 }
 
 void nrf24SpecStart() {
+    nrf24Wake();
     nrf24SpecInit();
     specRunning = true;
     radio.setAutoAck(false);
@@ -332,7 +387,11 @@ void nrf24SpecStart() {
     radio.openReadingPipe(1, dummyAddress);
 }
 
-void nrf24SpecStop() { specRunning = false; radio.stopListening(); }
+void nrf24SpecStop() {
+    specRunning = false;
+    radio.stopListening();
+    nrf24Sleep();
+}
 bool nrf24SpecIsRunning() { return specRunning; }
 uint32_t nrf24SpecGetFrames() { return specFrames; }
 
@@ -358,6 +417,7 @@ void nrf24SpecSetAnalysisChannel(int8_t ch) { (void)ch; }
 #define JAM_SWITCH_INTERVAL_US 200
 void nrf24StartJammer() {
     if (nrf24JammerActive) return;
+    nrf24Wake();
     // CORREÇÃO: verifica se o rádio NRF24 está conectado antes de tudo
     // Sem isso, radio.startConstCarrier() pode causar crash se o módulo
     // não responde (NRF24 desconectado ou pino solto)
@@ -389,6 +449,7 @@ void nrf24StopJammer() {
     radio.stopListening();
     radio.flush_tx();
     nrf24JammerActive = false;
+    nrf24Sleep();
 }
 int nrf24JammerLoop() {
     if (!nrf24JammerActive) return -1;
