@@ -2,18 +2,19 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 - Driver custom v3
+// CC1101 - Driver custom v4
 //
-// CORREÇÕES CRÍTICAS vs versão anterior:
-//   1. Removido waitMisoReady() com yield() — causava troca de
-//      tarefa WiFi com CSN LOW, corrompendo SPI.
-//   2. Substituído por delayMicroseconds fixo (igual ELECHOUSE
-//      e Flipper Zero subghz driver).
-//   3. CRITICAL SECTIONS com portMUX_TYPE — beginTransaction/endTransaction
-//      NÃO desativam interrupções no ESP32. WiFi AP gera interrupções
-//      DMA a cada ~100µs. Sem proteção, interrupção durante CSN LOW
-//      corrompe o comando SPI (SRX 0x34 vira SPWD 0x39 por exemplo).
-//      ESP-IDF 4.4+ exige portMUX_TYPE* como argumento.
+// CORREÇÕES CRÍTICAS vs versão v3:
+//   1. cc1101SendCommand: REMOVIDO dummy SNOP + 2 CSN cycles.
+//      A v3 fazia DOIS ciclos CSN dentro de UMA beginTransaction,
+//      o que corrompia o estado do periférico HSPI no ESP32.
+//      O segundo transfer() retornava lixo do buffer RX (0x0F).
+//      Agora usa UM ciclo CSN, UM transfer — igual ELECHOUSE
+//      e SmartRC-CC1101-Driver-Lib (que funcionam no ESP32).
+//   2. Adicionado waitMisoReady() antes/depois de command strobes.
+//      Espera MISO LOW (crystal pronto) como datasheet TI seção 11.2.
+//   3. CRITICAL SECTIONS com portMUX_TYPE — ESP-IDF 4.4+ requer
+//      portMUX_TYPE* como argumento.
 //   4. Re-init completo do SPI (end+begin) no wake — garante
 //      que o periférico HSPI está limpo após longo sleep.
 //   5. attachInterrupt REMOVIDO do wake — a ISR ficava armada
@@ -200,9 +201,23 @@ static void cc1101SpiReinit() {
     cc1101SpiInit();
 }
 
-// Delay fixo após CSN LOW — igual ELECHOUSE/Flipper
-// 10µs é suficiente quando o crystal está rodando (IDLE).
-// Após reset, waitMisoReadyLong() é usado para esperar o crystal.
+// Espera MISO (SO) ir LOW após CSN LOW.
+// O CC1101 pulsa MISO LOW quando o crystal está rodando e pronto.
+// Mesmo padrão do ELECHOUSE_CC1101 e SmartRC-CC1101-Driver-Lib.
+// Usa busy-wait SEM yield — seguro dentro de critical section.
+static inline void waitMisoReady() {
+    unsigned long t0 = micros();
+    while (digitalRead(CC1101_MISO) != LOW) {
+        if (micros() - t0 > 2000) {
+            Serial.println("[CC1101] WARN: MISO ready timeout!");
+            return;
+        }
+    }
+}
+
+// Delay fixo após CSN LOW para register access.
+// Register reads/writes usam 2 transfers em 1 CSN cycle e funcionam
+// bem com delay fixo. waitMisoReady() é usado apenas para command strobes.
 static inline void spiCsDelay() {
     delayMicroseconds(10);
 }
@@ -217,7 +232,6 @@ static void waitCrystalReady() {
             Serial.println("[CC1101] WARN: crystal timeout!");
             return;
         }
-        // SEM yield()! Busy-wait apenas.
     }
 }
 
@@ -280,24 +294,27 @@ static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
     return true;
 }
 
+// ============================================================
+// COMMAND STROBE v4 — FIX CRÍTICO
+//
+// ANTES (v3): Usava dummy SNOP + DOIS ciclos CSN dentro de
+// UMA beginTransaction. Isso corrompia o estado do periférico
+// HSPI no ESP32 — o segundo transfer() retornava lixo do
+// buffer RX. Todos os command strobes retornavam 0x0F.
+//
+// AGORA (v4): UM ciclo CSN, UM transfer — idêntico ao padrão
+// ELECHOUSE_CC1101 e SmartRC-CC1101-Driver-Lib.
+// Espera MISO LOW (crystal pronto) antes de enviar, igual
+// ao datasheet TI (seção 11.2 passo 6).
+// ============================================================
 void cc1101SendCommand(uint8_t cmd) {
     uint8_t status;
     portENTER_CRITICAL(&cc1101SpiMutex);
     spiCC1101.beginTransaction(cc1101SPISettings);
-    // FIX: No ESP32 HSPI, o primeiro byte lido apos beginTransaction
-    // frequentemente retorna lixo do RX FIFO interno (0x0F).
-    // Solucao: enviamos SNOP (0x3D) como transacao separada para
-    // flush o FIFO. SNOP e um no-op inofensivo no CC1101.
-    // Depois fazemos a transacao real com o comando.
     digitalWrite(CC1101_CSN, LOW);
-    spiCsDelay();
-    spiCC1101.transfer(CC1101_SNOP);  // dummy: flush stale RX byte
-    digitalWrite(CC1101_CSN, HIGH);
-    delayMicroseconds(2);  // min CSN high time
-    // Transacao real
-    digitalWrite(CC1101_CSN, LOW);
-    spiCsDelay();
-    status = spiCC1101.transfer(cmd);
+    waitMisoReady();                    // espera crystal (MISO LOW)
+    status = spiCC1101.transfer(cmd);  // envia comando, recebe status
+    waitMisoReady();                    // espera comando ser processado
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
     portEXIT_CRITICAL(&cc1101SpiMutex);
@@ -367,11 +384,13 @@ static bool cc1101Reset() {
 
     if (ms != 0x01) {
         Serial.printf("[CC1101] RESET: estado inesperado, enviando SIDLE...\n");
+        // Usa o mesmo padrão single-CSN do cc1101SendCommand
         portENTER_CRITICAL(&cc1101SpiMutex);
         spiCC1101.beginTransaction(cc1101SPISettings);
         digitalWrite(CC1101_CSN, LOW);
-        spiCsDelay();
+        waitMisoReady();
         spiCC1101.transfer(CC1101_SIDLE);
+        waitMisoReady();
         digitalWrite(CC1101_CSN, HIGH);
         spiCC1101.endTransaction();
         portEXIT_CRITICAL(&cc1101SpiMutex);
