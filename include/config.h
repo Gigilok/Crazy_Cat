@@ -11,8 +11,8 @@
 
 #define BTN_UP      5
 #define BTN_DOWN    27
-#define BTN_SELECT  16
-#define BTN_BACK    17
+#define BTN_SELECT  32
+#define BTN_BACK    33
 
 #define NRF_CE      26
 #define NRF_CSN     25
@@ -20,12 +20,12 @@
 #define NRF_MOSI    23
 #define NRF_MISO    19
 
-#define CC1101_GDO0 32
+#define CC1101_GDO0 17
 #define CC1101_CSN  15
 #define CC1101_SCK  14
 #define CC1101_MOSI 13
 #define CC1101_MISO 12
-#define CC1101_GDO2 33
+#define CC1101_GDO2 16
 
 #define BUZZER_PIN  4
 
