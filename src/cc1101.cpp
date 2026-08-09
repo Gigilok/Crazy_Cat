@@ -3,43 +3,30 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 - Driver custom v6
+// CC1101 - Driver custom v7
 //
-// BASE: Versão .fixed (a que funcionava parcialmente com WiFi OFF)
-// CORREÇÃO CRÍTICA vs .fixed:
-//   portENTER_CRITICAL() sem argumento foi removido no ESP-IDF 4.4+.
-//   Substituído por noInterrupts()/interrupts() que é o equivalente
-//   correto: DESATIVA interrupções no core atual durante SPI transfer.
+// BASE: Versão v6 (que funcionava com WiFi OFF manual)
+// CORREÇÕES v7:
+//   1. REMOVIDAS variáveis duplicadas (cc1101CopyActive,
+//      cc1101RollJamActive). Antes definidas em cc1101.cpp +
+//      globals.cpp + config.cpp (3 cópias!). O apiLoop()
+//      lia a cópia errada, chamando cc1101CaptureLoop()
+//      quando não devia. Agora usa extern do config.h.
+//   2. WiFi OFF: delay aumentado de 1.5s para 3s. O PA do
+//      WiFi (~300mA) precisa de mais tempo para descarregar.
+//   3. Settling check: se WiFi foi desligado há menos de 2s,
+//      espera o restante antes de operar CC1101.
+//   4. SPI reinit: agora faz reset completo dos GPIOs (INPUT)
+//      + 100ms de delay antes de re-iniciar HSPI. O GPIO
+//      matrix pode estar sujo após WiFi OFF.
+//   5. cc1101Wake() com retry: se o primeiro reset falhar,
+//      espera 1s, re-inicia SPI completamente, e tenta
+//      novamente. Resolve o "primeira tentativa falha".
 //
-// POR QUE noInterrupts() funciona e portENTER_CRITICAL(&mutex) NÃO:
-//   - portENTER_CRITICAL(&mutex) = spinlock. Bloqueia outras tasks
-//     no mesmo core mas NÃO desativa interrupções WiFi DMA.
-//   - noInterrupts() = xt_set_interrupt_level(1). DESATIVA todas
-//     interrupções mascaráveis no core atual. WiFi DMA não consegue
-//     interromper a transferência SPI.
-//
-// AUTO WI-FI OFF:
-//   WiFi AP gera interrupções DMA a cada ~100µs (beacons TX).
-//   Essas interrupções corrompem o MOSI durante transfers SPI
-//   (SRX 0x34 vira SPWD 0x39, chip vai pra SLEEP).
-//   noInterrupts() protege a transferência, mas a EMI do PA de TX
-//   do WiFi (pulsos de ~300mA) afeta o GPIO fisicamente.
-//   Solução: desligar WiFi completamente antes de usar CC1101.
-//   cc1101Wake() faz isso automaticamente.
-//
-// OUTRAS CORREÇÕES vs v5:
-//   - v5 adicionou waitMisoReady() que NÃO funciona em operação
-//     normal (MISO é data output, não crystal ready indicator)
-//   - v5 usou delayMicroseconds() que não yielda — WiFi TX bursts
-//     se acumulam e corrompem MOSI por EMI
-//   - v5 retry com SIDLE em chip SLEEP — inútil
-//   - v5 reset falso-positivo (retorna true com MARCSTATE=0x00)
-//   - Todos esses bugs foram removidos. Volta ao padrão .fixed.
-//
-// MANTIDO do v3/v5:
-//   - ISR attach/detach sob demanda (nunca left armada)
-//   - Re-init HSPI no wake
-//   - Status byte logado (pode ser stale —不影响功能)
+// MANTIDO do v6:
+//   - noInterrupts()/interrupts() para proteção SPI
+//   - ISR attach/detach sob demanda
+//   - Status byte pode ser stale (não afeta função)
 // ============================================================
 
 SPIClass spiCC1101(HSPI);
@@ -109,10 +96,12 @@ static bool spiInitialized = false;
 #define CC1101_WRITE_BURST  0x40
 
 bool cc1101Initialized = false;
-bool cc1101CopyActive = false;
+// cc1101CopyActive e cc1101RollJamActive NAO sao mais definidos aqui.
+// Usam a definicao de globals.cpp (declarados extern em config.h).
+// Antes havia triplo definição (cc1101.cpp + globals.cpp + config.cpp)
+// que causava leitura de cópia errada pelo apiLoop().
 uint8_t rj_state = 0;
 unsigned long rj_timer = 0;
-bool cc1101RollJamActive = false;
 
 extern unsigned long captureStartTime;
 
@@ -156,7 +145,7 @@ static bool cc1101Awake = false;
 static bool isrActuallyAttached = false;
 
 // ============================================================
-// AUTO WI-FI OFF — desliga WiFi antes de usar CC1101
+// AUTO WI-FI OFF — desliga WiFi ANTES de usar CC1101
 //
 // PROBLEMA: WiFi AP TX beacons a cada ~100µs. O pico de corrente
 // (~300mA) do PA causa EMI no GPIO 13 (MOSI), corrompendo os
@@ -166,12 +155,25 @@ static bool isrActuallyAttached = false;
 // SOLUÇÃO: Desligar WiFi completamente (WIFI_OFF) antes de
 // qualquer operação CC1101. O flag wifiDisabledByCC1101 evita
 // desligar repetidamente, e indica que o CC1101 desligou o WiFi.
+//
+// v7: Apos WiFi.mode(WIFI_OFF), espera 3s (era 1.5s) para
+// o PA do WiFi descarregar e a fonte estabilizar. Depois faz
+// um full SPI deinit com reset dos GPIOs e delay de 500ms
+// antes de re-iniciar o HSPI.
 // ============================================================
 static bool wifiDisabledByCC1101 = false;
+static unsigned long lastWiFiOffTime = 0;
 
 static void cc1101EnsureWiFiOff() {
     if (!wifiEnabled) {
-        // WiFi já está desligado (pelo usuário ou por nós)
+        // WiFi já está desligado. Verifica se deu tempo de settling.
+        unsigned long elapsed = millis() - lastWiFiOffTime;
+        if (elapsed < 2000) {
+            // Menos de 2s desde o último WiFi off — espera mais
+            Serial.printf("[CC1101] WiFi ja OFF ha apenas %lums, esperando settling...\n", elapsed);
+            Serial.flush();
+            delay(2000 - elapsed);
+        }
         wifiDisabledByCC1101 = false;
         return;
     }
@@ -181,12 +183,17 @@ static void cc1101EnsureWiFiOff() {
     stopAPIServer();
     WiFi.softAPdisconnect(true);
     WiFi.disconnect(true, true);
-    delay(300);
+    delay(500);
     WiFi.mode(WIFI_OFF);
-    delay(1500);
+    // Espera o PA do WiFi descarregar completamente e a fonte estabilizar.
+    // Antes era 1500ms — não era suficiente. Agora 3000ms.
+    Serial.println("[CC1101] Aguardando PA do WiFi descarregar (3s)...");
+    Serial.flush();
+    delay(3000);
     wifiEnabled = false;
     wifiDisabledByCC1101 = true;
-    Serial.println("[CC1101] WiFi desligado. CC1101 seguro para operar.");
+    lastWiFiOffTime = millis();
+    Serial.println("[CC1101] WiFi desligado. Settling completo.");
     Serial.flush();
 }
 
@@ -246,12 +253,20 @@ static void cc1101SpiInit() {
 
 // Re-inicializa o periférico HSPI. Necessário após longo sleep
 // porque o WiFi pode ter alterado registradores do GPIO matrix.
+// v7: Full deinit com reset completo dos GPIOs e delay de settling.
 static void cc1101SpiReinit() {
     if (spiInitialized) {
         spiCC1101.end();
         spiInitialized = false;
-        delayMicroseconds(10);
     }
+    // Reset completo dos GPIOs do HSPI — garante que o GPIO matrix
+    // está limpo antes de re-iniciar. O WiFi pode ter alterado
+    // as funções alternativas desses pinos.
+    pinMode(CC1101_SCK, INPUT);
+    pinMode(CC1101_MISO, INPUT);
+    pinMode(CC1101_MOSI, INPUT);
+    pinMode(CC1101_CSN, INPUT);
+    delay(100);
     cc1101SpiInit();
 }
 
@@ -264,15 +279,18 @@ static inline void spiCsDelay() {
 // Espera o crystal estabilizar após reset (MISO LOW = pronto).
 // Usa busy-wait SEM yield — seguro dentro de noInterrupts().
 // Timeout 200ms (crystal deve estabilizar em <1ms).
+// NAO usa Serial aqui — pode ser chamado dentro de noInterrupts()!
+static bool crystalReadyOk = true;
 static void waitCrystalReady() {
     unsigned long t0 = millis();
     while (digitalRead(CC1101_MISO) != LOW) {
         if (millis() - t0 > 200) {
-            Serial.println("[CC1101] WARN: crystal timeout!");
+            crystalReadyOk = false;
             return;
         }
         // SEM yield()! Busy-wait apenas.
     }
+    crystalReadyOk = true;
 }
 
 // ============================================================
@@ -399,6 +417,12 @@ static bool cc1101Reset() {
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
     interrupts();
+
+    // Log do crystal timeout FORA da seção crítica
+    if (!crystalReadyOk) {
+        Serial.println("[CC1101] RESET: WARN - crystal timeout!");
+        Serial.flush();
+    }
 
     // Datasheet: após SRES, espera ≥150µs para chip estabilizar
     delay(2);  // 2ms = bem acima do mínimo
@@ -656,10 +680,20 @@ bool cc1101Wake() {
     cc1101DetachISR();
     isr_enabled = false;
 
+    // Tenta reset com retry. Se falhar na primeira, espera mais
+    // e tenta novamente com SPI re-init completo.
     if (!cc1101Reset()) {
-        Serial.println("[CC1101] WAKE: reset falhou!");
-        cc1101Awake = false;
-        return false;
+        Serial.println("[CC1101] WAKE: reset falhou, esperando e tentando novamente...");
+        Serial.flush();
+        delay(1000);
+        cc1101SpiReinit();  // SPI completo com GPIO reset
+        delay(500);
+        if (!cc1101Reset()) {
+            Serial.println("[CC1101] WAKE: FALHOU — segundo reset tambem falhou");
+            Serial.flush();
+            cc1101Awake = false;
+            return false;
+        }
     }
 
     cc1101ConfigureRegs();
