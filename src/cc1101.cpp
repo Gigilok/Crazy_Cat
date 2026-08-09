@@ -1,4 +1,5 @@
 #include <SPI.h>
+#include <WiFi.h>
 #include "config.h"
 
 // ============================================================
@@ -16,6 +17,15 @@
 //   - noInterrupts() = xt_set_interrupt_level(1). DESATIVA todas
 //     interrupções mascaráveis no core atual. WiFi DMA não consegue
 //     interromper a transferência SPI.
+//
+// AUTO WI-FI OFF:
+//   WiFi AP gera interrupções DMA a cada ~100µs (beacons TX).
+//   Essas interrupções corrompem o MOSI durante transfers SPI
+//   (SRX 0x34 vira SPWD 0x39, chip vai pra SLEEP).
+//   noInterrupts() protege a transferência, mas a EMI do PA de TX
+//   do WiFi (pulsos de ~300mA) afeta o GPIO fisicamente.
+//   Solução: desligar WiFi completamente antes de usar CC1101.
+//   cc1101Wake() faz isso automaticamente.
 //
 // OUTRAS CORREÇÕES vs v5:
 //   - v5 adicionou waitMisoReady() que NÃO funciona em operação
@@ -144,6 +154,41 @@ static bool cc1101Awake = false;
 // Flag para saber se ISR está realmente attachada
 // Evita erro 'gpio_isr_service is not installed' no ESP32
 static bool isrActuallyAttached = false;
+
+// ============================================================
+// AUTO WI-FI OFF — desliga WiFi antes de usar CC1101
+//
+// PROBLEMA: WiFi AP TX beacons a cada ~100µs. O pico de corrente
+// (~300mA) do PA causa EMI no GPIO 13 (MOSI), corrompendo os
+// comandos SPI. SRX (0x34) vira SPWD (0x39) e o chip vai pra SLEEP.
+// Mesmo com noInterrupts(), a EMI física não é bloqueada.
+//
+// SOLUÇÃO: Desligar WiFi completamente (WIFI_OFF) antes de
+// qualquer operação CC1101. O flag wifiDisabledByCC1101 evita
+// desligar repetidamente, e indica que o CC1101 desligou o WiFi.
+// ============================================================
+static bool wifiDisabledByCC1101 = false;
+
+static void cc1101EnsureWiFiOff() {
+    if (!wifiEnabled) {
+        // WiFi já está desligado (pelo usuário ou por nós)
+        wifiDisabledByCC1101 = false;
+        return;
+    }
+    // WiFi está ligado — desligar para operação CC1101
+    Serial.println("[CC1101] WiFi ON detectado — desligando para operacao CC1101...");
+    Serial.flush();
+    stopAPIServer();
+    WiFi.softAPdisconnect(true);
+    WiFi.disconnect(true, true);
+    delay(300);
+    WiFi.mode(WIFI_OFF);
+    delay(1500);
+    wifiEnabled = false;
+    wifiDisabledByCC1101 = true;
+    Serial.println("[CC1101] WiFi desligado. CC1101 seguro para operar.");
+    Serial.flush();
+}
 
 // ============================================================
 // ISR — attach/detach sob demanda, nunca left armada
@@ -601,6 +646,10 @@ void cc1101Sleep() {
 
 bool cc1101Wake() {
     if (!cc1101Initialized) return false;
+
+    // AUTO WI-FI OFF: desliga WiFi antes de qualquer operação CC1101
+    cc1101EnsureWiFiOff();
+
     Serial.println("[CC1101] WAKE: acordando modulo...");
     Serial.flush();
 
@@ -1095,6 +1144,9 @@ bool cc1101IsAvailable() { return cc1101Initialized; }
 bool cc1101IsCapturing() { return cc1101CopyActive; }
 uint8_t cc1101GetSavedCount() { return savedSignalCount; }
 SignalData* cc1101GetSignal(uint8_t index) { if (index < savedSignalCount) return &savedSignals[index]; return nullptr; }
+
+// Indica se o CC1101 desligou o WiFi (para o menu poder mostrar)
+bool cc1101DidDisableWiFi() { return wifiDisabledByCC1101; }
 
 int8_t cc1101GetDroneRSSI() {
     if (!cc1101Initialized) return 0;
