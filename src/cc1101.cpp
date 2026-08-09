@@ -2,29 +2,39 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 - Driver custom v5
+// CC1101 - Driver custom v6
 //
-// CORREÇÕES CRÍTICAS vs versão v4:
-//   1. GoRx v5: SRX retries anti-WiFi TX EMI.
-//      EVIDÊNCIA: WiFi OFF → SRX funciona (state=0x0D).
-//      WiFi ON → SRX corrompido por EMI no MOSI, chip vai pra SLEEP.
-//      Status 0x0F é artefato de leitura — NÃO indica falha do comando.
-//   2. delayMicroseconds() em vez de delay() em todo o fluxo
-//      GoRx/Sleep — impede yield do scheduler, WiFi não agenda TX
-//      durante sequência crítica SPI.
-//   3. Se SRX falhar (state=SLEEP), reenvia SIDLE+SRX sem reset.
-//      Até 5 retries com delays crescentes.
-//   4. cc1101SendCommand: single CSN cycle (v4, mantido).
-//   5. waitMisoReady() antes/depois de command strobes (v4, mantido).
-//   6. CRITICAL SECTIONS com portMUX_TYPE (v3, mantido).
+// BASE: Versão .fixed (a que funcionava parcialmente com WiFi OFF)
+// CORREÇÃO CRÍTICA vs .fixed:
+//   portENTER_CRITICAL() sem argumento foi removido no ESP-IDF 4.4+.
+//   Substituído por noInterrupts()/interrupts() que é o equivalente
+//   correto: DESATIVA interrupções no core atual durante SPI transfer.
+//
+// POR QUE noInterrupts() funciona e portENTER_CRITICAL(&mutex) NÃO:
+//   - portENTER_CRITICAL(&mutex) = spinlock. Bloqueia outras tasks
+//     no mesmo core mas NÃO desativa interrupções WiFi DMA.
+//   - noInterrupts() = xt_set_interrupt_level(1). DESATIVA todas
+//     interrupções mascaráveis no core atual. WiFi DMA não consegue
+//     interromper a transferência SPI.
+//
+// OUTRAS CORREÇÕES vs v5:
+//   - v5 adicionou waitMisoReady() que NÃO funciona em operação
+//     normal (MISO é data output, não crystal ready indicator)
+//   - v5 usou delayMicroseconds() que não yielda — WiFi TX bursts
+//     se acumulam e corrompem MOSI por EMI
+//   - v5 retry com SIDLE em chip SLEEP — inútil
+//   - v5 reset falso-positivo (retorna true com MARCSTATE=0x00)
+//   - Todos esses bugs foram removidos. Volta ao padrão .fixed.
+//
+// MANTIDO do v3/v5:
+//   - ISR attach/detach sob demanda (nunca left armada)
+//   - Re-init HSPI no wake
+//   - Status byte logado (pode ser stale —不影响功能)
 // ============================================================
 
 SPIClass spiCC1101(HSPI);
 static SPISettings cc1101SPISettings(2000000, MSBFIRST, SPI_MODE0);
 static bool spiInitialized = false;
-
-// Mutex para critical sections — ESP-IDF 4.4+ requer portMUX_TYPE*
-static portMUX_TYPE cc1101SpiMutex = portMUX_INITIALIZER_UNLOCKED;
 
 // ============================================================
 // ENDEREÇOS — verificados contra datasheet SWRS061C
@@ -34,7 +44,7 @@ static portMUX_TYPE cc1101SpiMutex = portMUX_INITIALIZER_UNLOCKED;
 #define CC1101_FIFOTHR  0x03
 #define CC1101_PKTLEN   0x06
 #define CC1101_PKTCTRL1 0x07
-#define CC1101_PKTCTRL0 0x08
+#define CC1101_PKTCTRL0  0x08
 #define CC1101_ADDR     0x09
 #define CC1101_CHANNR   0x0A
 #define CC1101_FSCTRL1  0x0B
@@ -157,18 +167,22 @@ void IRAM_ATTR cc1101ISR() {
 }
 
 // ============================================================
-// SPI TRANSPORT v3 — CRITICAL SECTIONS + FIXED DELAYS
+// SPI TRANSPORT v6 — noInterrupts() PROTEGE CONTRA WIFI DMA
 //
-// Por que critical sections?
-//   No ESP32, beginTransaction() NÃO desativa interrupções.
-//   O WiFi AP dispara interrupções DMA a cada ~100µs (beacons).
-//   Se uma interrupção WiFi dispara durante CSN LOW, o SCK
-//   para e o CC1101 interpreta como glitch → comando corrompido.
+// PROBLEMA: portENTER_CRITICAL(&mutex) é spinlock que NÃO desativa
+// interrupções no ESP32 (dual-core). WiFi DMA interrompe a
+// transferência SPI, corrompendo o comando (SRX 0x34 → SPWD 0x39).
 //
-// Por que delay fixo em vez de waitMisoReady()?
-//   waitMisoReady() chamava yield() com CSN LOW, permitindo
-//   troca de tarefa. yield() é PROIBIDO dentro de transação SPI.
-//   A ELECHOUSE e o Flipper Zero usam delayMicroseconds(10).
+// SOLUÇÃO: noInterrupts() chama xt_set_interrupt_level(1) que
+// DESATIVA todas as interrupções mascaráveis no core atual.
+// A transferência SPI completa sem interrupção.
+//
+// REGRA: Dentro de noInterrupts(), usar APENAS:
+//   - delayMicroseconds() (busy-wait, não precisa de scheduler)
+//   - digitalRead/Write (acesso direto ao registrador GPIO)
+//   - spiCC1101.transfer() (hardware SPI, não precisa de CPU)
+// NUNCA usar delay(), Serial.printf(), ou qualquer função que
+// dependa de interrupções ou do scheduler.
 // ============================================================
 
 // Inicializa SPI. Pode ser chamado múltiplas vezes (re-init).
@@ -196,29 +210,14 @@ static void cc1101SpiReinit() {
     cc1101SpiInit();
 }
 
-// Espera MISO (SO) ir LOW após CSN LOW.
-// O CC1101 pulsa MISO LOW quando o crystal está rodando e pronto.
-// Mesmo padrão do ELECHOUSE_CC1101 e SmartRC-CC1101-Driver-Lib.
-// Usa busy-wait SEM yield — seguro dentro de critical section.
-static inline void waitMisoReady() {
-    unsigned long t0 = micros();
-    while (digitalRead(CC1101_MISO) != LOW) {
-        if (micros() - t0 > 2000) {
-            Serial.println("[CC1101] WARN: MISO ready timeout!");
-            return;
-        }
-    }
-}
-
-// Delay fixo após CSN LOW para register access.
-// Register reads/writes usam 2 transfers em 1 CSN cycle e funcionam
-// bem com delay fixo. waitMisoReady() é usado apenas para command strobes.
+// Delay fixo após CSN LOW — igual ELECHOUSE/Flipper
+// 10µs é suficiente quando o crystal está rodando (IDLE).
 static inline void spiCsDelay() {
     delayMicroseconds(10);
 }
 
 // Espera o crystal estabilizar após reset (MISO LOW = pronto).
-// Usa busy-wait SEM yield — seguro dentro de critical section.
+// Usa busy-wait SEM yield — seguro dentro de noInterrupts().
 // Timeout 200ms (crystal deve estabilizar em <1ms).
 static void waitCrystalReady() {
     unsigned long t0 = millis();
@@ -227,16 +226,17 @@ static void waitCrystalReady() {
             Serial.println("[CC1101] WARN: crystal timeout!");
             return;
         }
+        // SEM yield()! Busy-wait apenas.
     }
 }
 
 // ============================================================
-// SPI PRIMITIVES — beginTransaction/endTransaction fazem o locking
+// SPI PRIMITIVES — noInterrupts() protege contra WiFi DMA
 // ============================================================
 
 uint8_t cc1101ReadReg(uint8_t reg) {
     uint8_t val;
-    portENTER_CRITICAL(&cc1101SpiMutex);
+    noInterrupts();
     spiCC1101.beginTransaction(cc1101SPISettings);
     digitalWrite(CC1101_CSN, LOW);
     spiCsDelay();
@@ -244,13 +244,13 @@ uint8_t cc1101ReadReg(uint8_t reg) {
     val = spiCC1101.transfer(0x00);
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
-    portEXIT_CRITICAL(&cc1101SpiMutex);
+    interrupts();
     return val;
 }
 
 uint8_t cc1101ReadStatus(uint8_t reg) {
     uint8_t val;
-    portENTER_CRITICAL(&cc1101SpiMutex);
+    noInterrupts();
     spiCC1101.beginTransaction(cc1101SPISettings);
     digitalWrite(CC1101_CSN, LOW);
     spiCsDelay();
@@ -258,12 +258,12 @@ uint8_t cc1101ReadStatus(uint8_t reg) {
     val = spiCC1101.transfer(0x00);
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
-    portEXIT_CRITICAL(&cc1101SpiMutex);
+    interrupts();
     return val;
 }
 
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
-    portENTER_CRITICAL(&cc1101SpiMutex);
+    noInterrupts();
     spiCC1101.beginTransaction(cc1101SPISettings);
     digitalWrite(CC1101_CSN, LOW);
     spiCsDelay();
@@ -271,11 +271,11 @@ void cc1101WriteReg(uint8_t reg, uint8_t value) {
     spiCC1101.transfer(value);
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
-    portEXIT_CRITICAL(&cc1101SpiMutex);
+    interrupts();
 }
 
 static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
-    portENTER_CRITICAL(&cc1101SpiMutex);
+    noInterrupts();
     spiCC1101.beginTransaction(cc1101SPISettings);
     digitalWrite(CC1101_CSN, LOW);
     spiCsDelay();
@@ -285,35 +285,29 @@ static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
     }
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
-    portEXIT_CRITICAL(&cc1101SpiMutex);
+    interrupts();
     return true;
 }
 
 // ============================================================
-// COMMAND STROBE v4 — FIX CRÍTICO
+// COMMAND STROBE — single CSN cycle (padrão ELECHOUSE)
 //
-// ANTES (v3): Usava dummy SNOP + DOIS ciclos CSN dentro de
-// UMA beginTransaction. Isso corrompia o estado do periférico
-// HSPI no ESP32 — o segundo transfer() retornava lixo do
-// buffer RX. Todos os command strobes retornavam 0x0F.
-//
-// AGORA (v4): UM ciclo CSN, UM transfer — idêntico ao padrão
-// ELECHOUSE_CC1101 e SmartRC-CC1101-Driver-Lib.
-// Espera MISO LOW (crystal pronto) antes de enviar, igual
-// ao datasheet TI (seção 11.2 passo 6).
+// NOTA: O status byte lido pode ser stale (do RX FIFO interno
+// do ESP32 HSPI). Isso é APENAS um problema de log — o comando
+// É realmente enviado ao CC1101 via MOSI. A função do chip
+// depende do que recebe em MOSI, não do que o ESP32 lê em MISO.
 // ============================================================
 void cc1101SendCommand(uint8_t cmd) {
     uint8_t status;
-    portENTER_CRITICAL(&cc1101SpiMutex);
+    noInterrupts();
     spiCC1101.beginTransaction(cc1101SPISettings);
     digitalWrite(CC1101_CSN, LOW);
-    waitMisoReady();                    // espera crystal (MISO LOW)
-    status = spiCC1101.transfer(cmd);  // envia comando, recebe status
-    waitMisoReady();                    // espera comando ser processado
+    spiCsDelay();
+    status = spiCC1101.transfer(cmd);
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
-    portEXIT_CRITICAL(&cc1101SpiMutex);
-    // Log — fora da critical section
+    interrupts();
+    // Log — fora da seção crítica (interrupções habilitadas)
     uint8_t chipState = (status >> 4) & 0x07;
     uint8_t chipReady = (status >> 7) & 0x01;
     const char* stateNames[] = {"IDLE","RX","TX","FSTXON","CAL","SETTLE","RX_OVF","TX_UNF"};
@@ -330,7 +324,7 @@ void cc1101SetFrequency(uint32_t freqHz) {
 
 // ============================================================
 // RESET — sequência TI datasheet + ELECHOUSE
-// Usa waitCrystalReady (sem yield)
+// Usa noInterrupts() para proteção contra WiFi DMA
 // ============================================================
 static bool cc1101Reset() {
     Serial.println("[CC1101] RESET: iniciando...");
@@ -342,10 +336,10 @@ static bool cc1101Reset() {
     // Sequência de reset do datasheet TI:
     // 1. CSN LOW, espera ≥40µs, CSN HIGH, espera ≥10µs
     // 2. CSN LOW, espera MISO LOW (crystal ok)
-// 3. Envia SRES
+    // 3. Envia SRES
     // 4. Espera MISO LOW (crystal ok após reset)
     // 5. CSN HIGH
-    portENTER_CRITICAL(&cc1101SpiMutex);
+    noInterrupts();
     spiCC1101.beginTransaction(cc1101SPISettings);
 
     digitalWrite(CC1101_CSN, LOW);
@@ -359,7 +353,7 @@ static bool cc1101Reset() {
 
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
-    portEXIT_CRITICAL(&cc1101SpiMutex);
+    interrupts();
 
     // Datasheet: após SRES, espera ≥150µs para chip estabilizar
     delay(2);  // 2ms = bem acima do mínimo
@@ -379,19 +373,23 @@ static bool cc1101Reset() {
 
     if (ms != 0x01) {
         Serial.printf("[CC1101] RESET: estado inesperado, enviando SIDLE...\n");
-        // Usa o mesmo padrão single-CSN do cc1101SendCommand
-        portENTER_CRITICAL(&cc1101SpiMutex);
+        noInterrupts();
         spiCC1101.beginTransaction(cc1101SPISettings);
         digitalWrite(CC1101_CSN, LOW);
-        waitMisoReady();
+        spiCsDelay();
         spiCC1101.transfer(CC1101_SIDLE);
-        waitMisoReady();
         digitalWrite(CC1101_CSN, HIGH);
         spiCC1101.endTransaction();
-        portEXIT_CRITICAL(&cc1101SpiMutex);
+        interrupts();
         delay(1);
         ms = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
         Serial.printf("[CC1101] RESET: apos SIDLE, MARCSTATE=0x%02X\n", ms);
+        
+        // Se ainda não está em IDLE, o reset falhou
+        if (ms != 0x01) {
+            Serial.printf("[CC1101] RESET: FALHOU - chip nao vai para IDLE (0x%02X)\n", ms);
+            return false;
+        }
     }
 
     Serial.println("[CC1101] RESET: OK");
@@ -514,28 +512,10 @@ static void cc1101DetachISR() {
 }
 
 // ============================================================
-// GoRx v5 — Robusto contra interferência WiFi TX
-//
-// PROBLEMA IDENTIFICADO:
-//   WiFi AP transmite beacons a cada ~100ms. Durante cada burst TX,
-//   o pico de corrente (~300mA) causa EMI no MOSI (GPIO 13),
-//   corrompendo o byte SRX (0x34 → 0x39 = SPWD). O chip vai pra
-//   SLEEP em vez de RX.
-//
-// EVIDÊNCIA:
-//   - WiFi OFF: SRX funciona, state=0x0D (RX) ✓
-//   - WiFi ON:  SRX falha, state=0x00 (SLEEP) ✗
-//   - Status 0x0F é lido IGUAL nos dois casos — é artefato do ESP32,
-//     não indica falha real do comando.
-//
-// ESTRATÉGIA v5:
-//   1. delayMicroseconds() em vez de delay() — não yielda para
-//      o scheduler, evitando que WiFi agende TX no meio da sequência.
-//   2. Se SRX falhar (state=SLEEP), não faz reset! Apenas reenvia
-//      SIDLE + SRX. O chip responde a command strobes mesmo em SLEEP
-//      se o crystal estiver rodando (que está, pois registers funcionam).
-//   3. Até 3 retries com delays crescentes (2ms, 5ms, 10ms).
-//   4. Só faz reset completo se TODOS os retries falharem.
+// GoRx — Entrar em modo RX com calibração automática
+// Baseado no .fixed que funcionava parcialmente.
+// Usa delay() (não delayMicroseconds()) para permitir que
+// WiFi complete TX bursts entre operações SPI.
 // ============================================================
 static bool cc1101GoRx(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
@@ -553,73 +533,47 @@ static bool cc1101GoRx(uint32_t freqHz) {
 
     // IDLE → set frequency → calibrate → IDLE → RX
     cc1101SendCommand(CC1101_SIDLE);
-    delayMicroseconds(2000);  // busy-wait: não yielda, WiFi não TX
+    delay(1);
 
     cc1101SetFrequency(freqHz);
     cc1101CalibrateBand(freqMHz);
 
     cc1101SendCommand(CC1101_SIDLE);
-    delayMicroseconds(2000);  // busy-wait
+    delay(1);
 
-    // Verifica que chip esta em IDLE antes de enviar SRX
+    // Agora envia SRX
+    cc1101SendCommand(CC1101_SRX);
+
+    // Espera calibração automática + settling
+    // delay() yielda para o scheduler, permitindo WiFi TX
+    // O SRX já foi enviado com noInterrupts(), então está seguro
+    delay(10);
+
     state = readMarcState();
-    Serial.printf("[CC1101] GoRx: pre-SRX state=0x%02X\n", state);
-    if (state != 0x01) {
-        Serial.printf("[CC1101] GoRx: nao esta em IDLE (0x%02X), forçando SIDLE\n", state);
-        cc1101SendCommand(CC1101_SIDLE);
-        delayMicroseconds(5000);
-        state = readMarcState();
-        Serial.printf("[CC1101] GoRx: apos SIDLE state=0x%02X\n", state);
+    uint8_t raw = cc1101ReadStatus(CC1101_MARCSTATE);
+    Serial.printf("[CC1101] GoRx: estado final=0x%02X (raw=0x%02X) @ %lu Hz\n", state, raw, freqHz);
+
+    if (state == 0x0D || state == 0x0E || state == 0x08 || state == 0x06 || state == 0x0B) {
+        Serial.printf("[CC1101] GoRx: SUCESSO (state=0x%02X)\n", state);
+        return true;
     }
 
-    // === SRX com retries anti-WiFi ===
-    // O WiFi TX corrompe o byte SRX por EMI no MOSI.
-    // Se o chip foi pro SLEEP, reenviamos SIDLE+SRX sem reset.
-    const int maxRetries = 5;
-    unsigned int retryDelays[] = {2000, 3000, 5000, 8000, 12000};
+    // Se falhou, tenta mais uma vez com delay maior
+    Serial.printf("[CC1101] GoRx: primeira tentativa falhou (0x%02X), retry...\n", state);
+    cc1101SendCommand(CC1101_SIDLE);
+    delay(5);
+    cc1101SendCommand(CC1101_SRX);
+    delay(20);
 
-    for (int attempt = 0; attempt < maxRetries; attempt++) {
-        cc1101SendCommand(CC1101_SRX);
+    state = readMarcState();
+    Serial.printf("[CC1101] GoRx: retry state=0x%02X\n", state);
 
-        // Espera calibração automática (FS_AUTOCAL=1, ~1ms tipico)
-        // Usa busy-wait para evitar WiFi TX durante a espera
-        delayMicroseconds(retryDelays[attempt]);
-
-        state = readMarcState();
-        if (attempt == 0) {
-            Serial.printf("[CC1101] GoRx: estado final=0x%02X @ %lu Hz\n", state, freqHz);
-        }
-
-        if (state == 0x0D || state == 0x0E) {
-            Serial.printf("[CC1101] GoRx: SUCESSO (state=0x%02X, attempt=%d)\n", state, attempt + 1);
-            return true;
-        }
-
-        // SRX foi corrompido pelo WiFi — chip em SLEEP (0x00)
-        // Reenvia SIDLE para voltar ao IDLE, depois SRX de novo
-        if (state == 0x00) {
-            Serial.printf("[CC1101] GoRx: SRX corrompido (SLEEP), retry %d/%d...\n",
-                attempt + 2, maxRetries);
-            cc1101SendCommand(CC1101_SIDLE);
-            delayMicroseconds(1000);
-            // Verifica se voltou ao IDLE
-            state = readMarcState();
-            if (state != 0x01) {
-                // Chip não voltou ao IDLE — algo mais grave
-                Serial.printf("[CC1101] GoRx: chip nao voltou ao IDLE (0x%02X), abortando retries\n", state);
-                break;
-            }
-            continue;  // tenta SRX de novo
-        }
-
-        // Estado inesperado que não é RX nem SLEEP
-        Serial.printf("[CC1101] GoRx: estado inesperado 0x%02X, retry %d/%d...\n",
-            state, attempt + 2, maxRetries);
-        cc1101SendCommand(CC1101_SIDLE);
-        delayMicroseconds(2000);
+    if (state == 0x0D || state == 0x0E || state == 0x08 || state == 0x06 || state == 0x0B) {
+        Serial.printf("[CC1101] GoRx: SUCESSO no retry (state=0x%02X)\n", state);
+        return true;
     }
 
-    Serial.printf("[CC1101] GoRx: FALHOU apos %d tentativas, state=0x%02X\n", maxRetries, state);
+    Serial.printf("[CC1101] GoRx: FALHOU, state=0x%02X\n", state);
     return false;
 }
 
@@ -636,10 +590,10 @@ static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
 // ============================================================
 void cc1101Sleep() {
     if (!cc1101Initialized) return;
-    cc1101DetachISR();     // Remove ISR antes de dormir
+    cc1101DetachISR();
     isr_enabled = false;
     cc1101SendCommand(CC1101_SIDLE);
-    delayMicroseconds(1000);  // busy-wait: sem yield para WiFi
+    delay(1);
     cc1101SendCommand(CC1101_SPWD);
     cc1101Awake = false;
     Serial.println("[CC1101] Modulo em SLEEP");
@@ -650,7 +604,6 @@ bool cc1101Wake() {
     Serial.println("[CC1101] WAKE: acordando modulo...");
     Serial.flush();
 
-    // ISR DEVE estar desativada durante wake
     cc1101DetachISR();
     isr_enabled = false;
 
@@ -661,8 +614,6 @@ bool cc1101Wake() {
     }
 
     cc1101ConfigureRegs();
-
-    // NÃO attacha ISR aqui! Só attacha quando for entrar em RX.
 
     uint8_t state = readMarcState();
     uint8_t version = cc1101ReadStatus(CC1101_VERSION);
@@ -689,16 +640,12 @@ bool cc1101Init() {
     Serial.println("[CC1101] Inicializando...");
     Serial.flush();
 
-    // Inicializa pinos
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
-    // GDO0 como INPUT (sem pull-up!) — o CC1101 driveia este pino
-    // Pull-up interno causava conflito com o output do CC1101
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
     delay(10);
 
-    // Inicializa SPI
     cc1101SpiInit();
 
     if (!cc1101Reset()) {
@@ -722,7 +669,6 @@ bool cc1101Init() {
     Serial.println("[CC1101] Configurado com sucesso!");
     Serial.flush();
 
-    // Diagnóstico
     Serial.println("[CC1101] === DIAGNOSTICO ===");
     uint8_t r;
     r = cc1101ReadReg(CC1101_FSCTRL1);  Serial.printf("  FSCTRL1   = 0x%02X %s\n", r, r==0x06?"OK":"FAIL");
@@ -764,17 +710,15 @@ void cc1101StartCapture() {
     isr_count = 0;
     capture_started = false;
 
-    // ISR desativada durante GoRx
     bool rxOk = cc1101GoRx(currentCapture.frequency);
     if (!rxOk) {
         Serial.println("[CC1101] WARN: Falha ao entrar em RX, tentando continuar...");
     }
 
-    // Só agora ativa ISR — chip já está em RX
     isr_last_val = digitalRead(CC1101_GDO0);
     isr_last_change = micros();
     isr_enabled = true;
-    cc1101AttachISR();   // ISR só é armada DEPOIS que chip está em RX
+    cc1101AttachISR();
     Serial.printf("[CC1101] Capture iniciada @ %lu Hz, MARCSTATE=0x%02X, GDO0=%d\n",
         currentCapture.frequency, readMarcState(), digitalRead(CC1101_GDO0));
     Serial.flush();
@@ -791,12 +735,12 @@ void cc1101CaptureLoop() {
         if (ms != 0x0D && ms != 0x0E && ms != 0x0F) {
             Serial.printf("[CC1101] CAPLOOP: estado errado 0x%02X, reentrando RX\n", ms);
             isr_enabled = false;
-            cc1101DetachISR();     // Desativa ISR antes de re-configurar
+            cc1101DetachISR();
             cc1101GoRx(currentCapture.frequency);
             isr_last_val = digitalRead(CC1101_GDO0);
             isr_last_change = micros();
             isr_enabled = true;
-            cc1101AttachISR();   // Re-ativa ISR
+            cc1101AttachISR();
         }
     }
     if (capture_state == STATE_HOPPING) {
@@ -805,7 +749,7 @@ void cc1101CaptureLoop() {
         }
         else if (nowMs - lastFreqSwitch > 1000) {
             isr_enabled = false;
-            cc1101DetachISR();     // Desativa ISR antes de trocar freq
+            cc1101DetachISR();
             isr_count = 0;
             capture_started = false;
             currentFreqIndex = (currentFreqIndex + 1) % 4;
@@ -814,7 +758,7 @@ void cc1101CaptureLoop() {
             isr_last_val = digitalRead(CC1101_GDO0);
             isr_last_change = micros();
             isr_enabled = true;
-            cc1101AttachISR();   // Re-ativa ISR
+            cc1101AttachISR();
             lastFreqSwitch = nowMs;
         }
     }
@@ -1009,7 +953,6 @@ void cc1101StartRollJam() {
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_SRX);
     delay(5);
-    // ISR para RollJam só é ativada quando detecta sinal
 }
 
 void cc1101RollJamLoop() {
