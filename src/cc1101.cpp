@@ -2,31 +2,37 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 - Driver v10 (ELECHOUSE pattern + HSPI dedicado)
+// CC1101 - Driver v11 (SPI transport IDENTICO ao ELECHOUSE JT_DRV)
 //
-// CORREÇÃO CRÍTICA vs v9:
-//   v9 usava SPI global (#define CC1101_SSPI SPI).
-//   O NRF24 também usa SPI global (nrf24.cpp:93):
-//     SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN);
-//   Cada SPI.begin() sobrescreve a config do outro!
-//   NRF24 pins: 18/19/23/25  vs  CC1101 pins: 14/12/13/15
+// CORREÇÃO vs v10 — 3 bugs no transporte SPI:
 //
-// SOLUÇÃO: SPIClass(HSPI) dedicado (igual v4 e JT_DRV).
-//   HSPI é um periférico SPI separado no ESP32.
-//   NRF24 usa FSPI/VSPI (via global SPI), CC1101 usa HSPI.
-//   Zero conflito.
+// BUG 1: spiStart() chamava pinMode() x4 ANTES de begin().
+//   JT_DRV NÃO faz isso. No ESP32, pinMode() antes de begin()
+//   configura os pinos como GPIO padrão. Depois begin() tenta
+//   reconfigurar via GPIO matrix. Esse conflito pode corromper
+//   a rota dos pinos, especialmente após múltiplos ciclos.
 //
-// PADRÃO ELECHOUSE mantido:
-//   1. begin() + end() a CADA operação
-//   2. while(digitalRead(MISO)) para esperar crystal
-//   3. delay(1) no reset (igual ELECHOUSE)
-//   4. SEM portENTER_CRITICAL (ELECHOUSE não usa)
+// BUG 2: spiEnd() só chamava end(), sem endTransaction().
+//   JT_DRV chama endTransaction() ANTES de end(). Sem isso,
+//   o mutex interno do SPI pode não ser liberado corretamente.
+//   Após alguns ciclos begin/end, o bus fica travado e todos
+//   os transfers retornam 0x00 (SPI morto).
+//
+// BUG 3: static SPIClass spiCC1101(HSPI) vs new SPIClass(HSPI).
+//   JT_DRV cria a instância com new dentro de Init(). O objeto
+//   estático global pode ter problemas de ordem de construção
+//   com o framework ESP32.
+//
+// SOLUÇÃO: Copiar EXATAMENTE o padrão JT_DRV:
+//   - SPIClass* hspi = NULL (ponteiro global)
+//   - hspi = new SPIClass(HSPI) dentro de cc1101Init()
+//   - spiStart() = só hspi->begin(pins), SEM pinMode
+//   - spiEnd() = hspi->endTransaction() + hspi->end()
+//   - cc1101Init() faz pinMode só no SS pin (igual JT_DRV)
 // ============================================================
 
-// SPI DEDICADO — barramento HSPI separado do NRF24
-// Igual ao v4 (SPIClass spiCC1101(HSPI)) e ao JT_DRV
-// da biblioteca ELECHOUSE (new SPIClass(HSPI)).
-static SPIClass spiCC1101(HSPI);
+// SPI DEDICADO — ponteiro, igual JT_DRV (hspi = new SPIClass(HSPI))
+static SPIClass* hspi = NULL;
 
 // ============================================================
 // ENDEREÇOS — verificados contra datasheet SWRS061C
@@ -93,8 +99,6 @@ static SPIClass spiCC1101(HSPI);
 // VARIÁVEIS DE ESTADO
 // ============================================================
 bool cc1101Initialized = false;
-// cc1101CopyActive e cc1101RollJamActive são definidos em
-// config.cpp (única definição). Aqui usamos extern via config.h.
 
 uint8_t rj_state = 0;
 unsigned long rj_timer = 0;
@@ -138,7 +142,7 @@ static bool cc1101Awake = false;
 static bool isrActuallyAttached = false;
 
 // ============================================================
-// ISR — attach/detach sob demanda (igual v4)
+// ISR — attach/detach sob demanda
 // ============================================================
 void IRAM_ATTR cc1101ISR() {
     if (!isr_enabled) return;
@@ -173,31 +177,25 @@ static void cc1101DetachISR() {
 }
 
 // ============================================================
-// SPI TRANSPORT v9 — PADRÃO ELECHOUSE
+// SPI TRANSPORT v11 — CÓPIA EXATA DO ELECHOUSE JT_DRV
 //
-// begin() + end() a CADA operação.
-// Isso reconfigura o GPIO matrix do zero,
-// impedindo corrupção silenciosa pelo WiFi.
+// SpiStart = só hspi->begin(pins). SEM pinMode.
+// SpiEnd   = endTransaction() + end().
 //
-// while(digitalRead(MISO)) espera o crystal estar
-// pronto antes de cada transferência.
-//
-// SEM noInterrupts/portENTER_CRITICAL — ELECHOUSE
-// funciona sem e é mais simples.
+// begin() internamente configura o GPIO matrix.
+// pinMode() ANTES de begin() sobrescreve e causa conflito.
+// endTransaction() libera o mutex do SPI antes de end().
 // ============================================================
 
-// Inicia SPI para uma operação (igual ELECHOUSE SpiStart)
 static void spiStart(void) {
-    pinMode(CC1101_SCK, OUTPUT);
-    pinMode(CC1101_MOSI, OUTPUT);
-    pinMode(CC1101_MISO, INPUT);
-    pinMode(CC1101_CSN, OUTPUT);
-    spiCC1101.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
+    // IDENTICO ao JT_DRV: só begin(), sem pinMode
+    hspi->begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
 }
 
-// Encerra SPI após uma operação (igual ELECHOUSE SpiEnd)
 static void spiEnd(void) {
-    spiCC1101.end();
+    // IDENTICO ao JT_DRV: endTransaction ANTES de end
+    hspi->endTransaction();
+    hspi->end();
 }
 
 // ============================================================
@@ -210,8 +208,8 @@ uint8_t cc1101ReadReg(uint8_t reg) {
     spiStart();
     digitalWrite(CC1101_CSN, LOW);
     while (digitalRead(CC1101_MISO));
-    spiCC1101.transfer(reg | CC1101_READ_SINGLE);
-    uint8_t val = spiCC1101.transfer(0x00);
+    hspi->transfer(reg | CC1101_READ_SINGLE);
+    uint8_t val = hspi->transfer(0x00);
     digitalWrite(CC1101_CSN, HIGH);
     spiEnd();
     return val;
@@ -221,8 +219,8 @@ uint8_t cc1101ReadStatus(uint8_t reg) {
     spiStart();
     digitalWrite(CC1101_CSN, LOW);
     while (digitalRead(CC1101_MISO));
-    spiCC1101.transfer(reg | CC1101_READ_BURST);
-    uint8_t val = spiCC1101.transfer(0x00);
+    hspi->transfer(reg | CC1101_READ_BURST);
+    uint8_t val = hspi->transfer(0x00);
     digitalWrite(CC1101_CSN, HIGH);
     spiEnd();
     return val;
@@ -232,8 +230,8 @@ void cc1101WriteReg(uint8_t reg, uint8_t value) {
     spiStart();
     digitalWrite(CC1101_CSN, LOW);
     while (digitalRead(CC1101_MISO));
-    spiCC1101.transfer(reg);
-    spiCC1101.transfer(value);
+    hspi->transfer(reg);
+    hspi->transfer(value);
     digitalWrite(CC1101_CSN, HIGH);
     spiEnd();
 }
@@ -242,9 +240,9 @@ static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
     spiStart();
     digitalWrite(CC1101_CSN, LOW);
     while (digitalRead(CC1101_MISO));
-    spiCC1101.transfer(reg | CC1101_WRITE_BURST);
+    hspi->transfer(reg | CC1101_WRITE_BURST);
     for (uint8_t i = 0; i < len; i++) {
-        spiCC1101.transfer(data[i]);
+        hspi->transfer(data[i]);
     }
     digitalWrite(CC1101_CSN, HIGH);
     spiEnd();
@@ -255,10 +253,9 @@ void cc1101SendCommand(uint8_t cmd) {
     spiStart();
     digitalWrite(CC1101_CSN, LOW);
     while (digitalRead(CC1101_MISO));
-    uint8_t status = spiCC1101.transfer(cmd);
+    uint8_t status = hspi->transfer(cmd);
     digitalWrite(CC1101_CSN, HIGH);
     spiEnd();
-    // Log do status byte
     uint8_t chipState = (status >> 4) & 0x07;
     uint8_t chipReady = (status >> 7) & 0x01;
     const char* stateNames[] = {"IDLE","RX","TX","FSTXON","CAL","SETTLE","RX_OVF","TX_UNF"};
@@ -289,7 +286,7 @@ static bool cc1101Reset() {
     delay(1);
     digitalWrite(CC1101_CSN, LOW);
     while (digitalRead(CC1101_MISO));
-    spiCC1101.transfer(CC1101_SRES);
+    hspi->transfer(CC1101_SRES);
     while (digitalRead(CC1101_MISO));
     digitalWrite(CC1101_CSN, HIGH);
     spiEnd();
@@ -330,7 +327,7 @@ static void cc1101ConfigureRegs() {
     cc1101WriteReg(CC1101_IOCFG0,   0x0D);
     cc1101WriteReg(CC1101_PKTCTRL0, 0x32);
     cc1101WriteReg(CC1101_MDMCFG3,  0x93);
-    cc1101WriteReg(CC1101_MDMCFG4,  0x07);
+    cc1101WriteReg(CC1101_MDMCFG4, 0x07);
 
     cc1101WriteReg(CC1101_MDMCFG2,  0x30);
     cc1101WriteReg(CC1101_FREND0,   0x11);
@@ -418,9 +415,9 @@ static uint8_t readMarcState() {
 }
 
 // ============================================================
-// GoRx — versão simplificada (mais perto do ELECHOUSE SetRx)
-// ELECHOUSE: SIDLE → SRX. Pronto.
-// Nós precisamos de mais: set frequency + calibrate.
+// GoRx — simplificado para casar com ELECHOUSE SetRx(mhz)
+// ELECHOUSE: SIDLE → setMHZ(mhz) → SRX. Pronto.
+// Sem delays extras, sem SIDLE duplo.
 // ============================================================
 static bool cc1101GoRx(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
@@ -436,18 +433,14 @@ static bool cc1101GoRx(uint32_t freqHz) {
 
     cc1101DetachISR();
 
+    // Padrão ELECHOUSE SetRx(mhz): SIDLE → setFreq → SRX
     cc1101SendCommand(CC1101_SIDLE);
-    delay(1);
     cc1101SetFrequency(freqHz);
     cc1101CalibrateBand(freqMHz);
-    cc1101SendCommand(CC1101_SIDLE);
-    delay(1);
     cc1101SendCommand(CC1101_SRX);
-    delay(10);
 
     state = readMarcState();
-    uint8_t raw = cc1101ReadStatus(CC1101_MARCSTATE);
-    Serial.printf("[CC1101] GoRx: estado final=0x%02X (raw=0x%02X) @ %lu Hz\n", state, raw, freqHz);
+    Serial.printf("[CC1101] GoRx: estado final=0x%02X @ %lu Hz\n", state, freqHz);
 
     if (state == 0x0D || state == 0x0E || state == 0x08 || state == 0x06 || state == 0x0B) {
         Serial.println("[CC1101] GoRx: SUCESSO");
@@ -457,9 +450,7 @@ static bool cc1101GoRx(uint32_t freqHz) {
     // Retry uma vez
     Serial.printf("[CC1101] GoRx: falhou (0x%02X), retry...\n", state);
     cc1101SendCommand(CC1101_SIDLE);
-    delay(5);
     cc1101SendCommand(CC1101_SRX);
-    delay(20);
 
     state = readMarcState();
     if (state == 0x0D || state == 0x0E || state == 0x08 || state == 0x06 || state == 0x0B) {
@@ -474,7 +465,6 @@ static bool cc1101GoRx(uint32_t freqHz) {
 static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
     cc1101SendCommand(CC1101_SIDLE);
-    delay(1);
     cc1101SetFrequency(freqHz);
     cc1101CalibrateBand(freqMHz);
 }
@@ -486,8 +476,8 @@ void cc1101Sleep() {
     if (!cc1101Initialized) return;
     cc1101DetachISR();
     isr_enabled = false;
+    // Igual ELECHOUSE goSleep(): SIDLE + SPWD
     cc1101SendCommand(CC1101_SIDLE);
-    delay(1);
     cc1101SendCommand(CC1101_SPWD);
     cc1101Awake = false;
     Serial.println("[CC1101] Modulo em SLEEP");
@@ -534,18 +524,17 @@ bool cc1101Init() {
     Serial.println("[CC1101] Inicializando...");
     Serial.flush();
 
-    // Configura pinos
-    pinMode(CC1101_CSN, OUTPUT);
-    digitalWrite(CC1101_CSN, HIGH);
+    // Criar instância HSPI — IGUAL JT_DRV: new SPIClass(HSPI)
+    hspi = new SPIClass(HSPI);
+
+    // Configurar GDO pins (não são SPI)
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
-    delay(10);
 
-    // Inicializa SPI (e já faz o primeiro reset via ELECHOUSE)
+    // Iniciar SPI e configurar SS pin — IGUAL JT_DRV
     spiStart();
+    pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
-    digitalWrite(CC1101_SCK, HIGH);
-    digitalWrite(CC1101_MOSI, LOW);
 
     // Reset ELECHOUSE
     digitalWrite(CC1101_CSN, LOW);
@@ -554,10 +543,9 @@ bool cc1101Init() {
     delay(1);
     digitalWrite(CC1101_CSN, LOW);
     while (digitalRead(CC1101_MISO));
-    spiCC1101.transfer(CC1101_SRES);
+    hspi->transfer(CC1101_SRES);
     while (digitalRead(CC1101_MISO));
     digitalWrite(CC1101_CSN, HIGH);
-    spiEnd();
     delay(2);
 
     cc1101ConfigureRegs();
@@ -569,6 +557,7 @@ bool cc1101Init() {
 
     if (partnum == 0xFF && version == 0xFF) {
         Serial.println("[CC1101] FAIL: modulo nao responde (0xFF)");
+        spiEnd();
         return false;
     }
 
@@ -593,7 +582,15 @@ bool cc1101Init() {
     Serial.println("[CC1101] === FIM DIAGNOSTICO ===");
     Serial.flush();
 
-    cc1101Sleep();
+    // Encerrar SPI e dormir — IGUAL JT_DRV: SpiEnd() no final de Init()
+    spiEnd();
+    cc1101Awake = false;
+
+    // Colocar em sleep via strobes (spiStart/end internos)
+    cc1101SendCommand(CC1101_SIDLE);
+    cc1101SendCommand(CC1101_SPWD);
+    Serial.println("[CC1101] Modulo em SLEEP");
+
     return true;
 }
 
