@@ -84,6 +84,7 @@ static portMUX_TYPE cc1101SpiMutex = portMUX_INITIALIZER_UNLOCKED;
 #define CC1101_SIDLE    0x36
 #define CC1101_SPWD     0x39
 #define CC1101_SFRX     0x3A
+#define CC1101_SNOP     0x3D
 #define CC1101_PATABLE  0x3E
 
 // SPI access
@@ -133,6 +134,10 @@ uint8_t spec_an_idx = 0;
 bool spec_an_running = false;
 
 static bool cc1101Awake = false;
+
+// Flag para saber se ISR está realmente attachada
+// Evita erro 'gpio_isr_service is not installed' no ESP32
+static bool isrActuallyAttached = false;
 
 // ============================================================
 // ISR — attach/detach sob demanda, nunca left armada
@@ -279,13 +284,24 @@ void cc1101SendCommand(uint8_t cmd) {
     uint8_t status;
     portENTER_CRITICAL(&cc1101SpiMutex);
     spiCC1101.beginTransaction(cc1101SPISettings);
+    // FIX: No ESP32 HSPI, o primeiro byte lido apos beginTransaction
+    // frequentemente retorna lixo do RX FIFO interno (0x0F).
+    // Solucao: enviamos SNOP (0x3D) como transacao separada para
+    // flush o FIFO. SNOP e um no-op inofensivo no CC1101.
+    // Depois fazemos a transacao real com o comando.
+    digitalWrite(CC1101_CSN, LOW);
+    spiCsDelay();
+    spiCC1101.transfer(CC1101_SNOP);  // dummy: flush stale RX byte
+    digitalWrite(CC1101_CSN, HIGH);
+    delayMicroseconds(2);  // min CSN high time
+    // Transacao real
     digitalWrite(CC1101_CSN, LOW);
     spiCsDelay();
     status = spiCC1101.transfer(cmd);
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
     portEXIT_CRITICAL(&cc1101SpiMutex);
-    // Log status byte — fora da critical section (Serial.printf pode bloquear)
+    // Log — fora da critical section
     uint8_t chipState = (status >> 4) & 0x07;
     uint8_t chipReady = (status >> 7) & 0x01;
     const char* stateNames[] = {"IDLE","RX","TX","FSTXON","CAL","SETTLE","RX_OVF","TX_UNF"};
@@ -470,11 +486,17 @@ static uint8_t readMarcState() {
 // Attach/detach ISR — só quando necessário
 // ============================================================
 static void cc1101AttachISR() {
-    attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
+    if (!isrActuallyAttached) {
+        attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
+        isrActuallyAttached = true;
+    }
 }
 
 static void cc1101DetachISR() {
-    detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
+    if (isrActuallyAttached) {
+        detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
+        isrActuallyAttached = false;
+    }
 }
 
 // ============================================================
@@ -489,36 +511,53 @@ static bool cc1101GoRx(uint32_t freqHz) {
 
     if (state == 0x00) {
         Serial.println("[CC1101] GoRx: chip em SLEEP, resetando...");
-        cc1101DetachISR();     // Garante ISR desativada durante reset
+        cc1101DetachISR();
         if (!cc1101Reset()) return false;
         cc1101ConfigureRegs();
     }
 
-    // Garante ISR desativada durante toda a configuração
     cc1101DetachISR();
 
     // IDLE → set frequency → calibrate → IDLE → RX
     cc1101SendCommand(CC1101_SIDLE);
-    delay(1);
+    delay(2);
 
     cc1101SetFrequency(freqHz);
     cc1101CalibrateBand(freqMHz);
 
     cc1101SendCommand(CC1101_SIDLE);
-    delay(1);
+    delay(2);
 
-    // Agora envia SRX
+    // Verifica que chip esta em IDLE antes de enviar SRX
+    state = readMarcState();
+    Serial.printf("[CC1101] GoRx: pre-SRX state=0x%02X\n", state);
+    if (state != 0x01) {
+        Serial.printf("[CC1101] GoRx: nao esta em IDLE (0x%02X), forçando SIDLE\n", state);
+        cc1101SendCommand(CC1101_SIDLE);
+        delay(5);
+        state = readMarcState();
+        Serial.printf("[CC1101] GoRx: apos SIDLE state=0x%02X\n", state);
+    }
+
+    // Envia SRX
     cc1101SendCommand(CC1101_SRX);
 
-    // Espera calibração automática + settling
-    delay(10);
+    // Espera calibracao automatica + settling (a calibracao leva ~1ms tipico)
+    // Mas damos 20ms para margem de seguranca
+    delay(20);
 
     state = readMarcState();
-    uint8_t raw = cc1101ReadStatus(CC1101_MARCSTATE);
-    Serial.printf("[CC1101] GoRx: estado final=0x%02X (raw=0x%02X) @ %lu Hz\n", state, raw, freqHz);
+    Serial.printf("[CC1101] GoRx: estado final=0x%02X @ %lu Hz\n", state, freqHz);
 
-    if (state == 0x0D || state == 0x08 || state == 0x06 || state == 0x0B) {
-        Serial.println("[CC1101] GoRx: SUCESSO");
+    // Se nao entrou em RX, espera mais e verifica de novo
+    if (state != 0x0D && state != 0x0E) {
+        delay(30);
+        state = readMarcState();
+        Serial.printf("[CC1101] GoRx: retry state=0x%02X\n", state);
+    }
+
+    if (state == 0x0D || state == 0x0E) {
+        Serial.printf("[CC1101] GoRx: SUCESSO (state=0x%02X)\n", state);
         return true;
     }
 
