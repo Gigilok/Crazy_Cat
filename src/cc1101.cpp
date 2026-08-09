@@ -62,6 +62,7 @@ SPIClass spiCC1101(HSPI);
 #define CC1101_PKTCTRL0 0x08
 #define CC1101_ADDR     0x09
 #define CC1101_CHANNR   0x0A
+#define CC1101_PKTLEN   0x06
 #define CC1101_FSCTRL1  0x0B
 #define CC1101_FSCTRL0  0x0C
 #define CC1101_FREQ2    0x0D
