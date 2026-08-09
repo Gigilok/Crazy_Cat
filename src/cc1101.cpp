@@ -13,10 +13,13 @@
 //   que fazia begin()/end(). Após ~20 ciclos, os pinos ficavam
 //   permanentemente corrompidos e todo SPI retornava 0x00.
 //
-// SOLUÇÃO v12.1:
+// SOLUÇÃO v12.2:
 //   - spiStart(): chama hspi->begin(pins) só na PRIMEIRA vez. Depois é no-op.
 //   - spiEnd(): NÃO faz nada. Bus HSPI permanece travado nos pinos 12-15.
-//   - spiBusRelease(): chama hspi->end(). Só no cc1101Sleep().
+//   - spiBusRelease(): chama hspi->end() E limpa GPIO matrix dos pinos.
+//     Sem isso, os pinos continuam roteados pro HSPI "morto" após end(),
+//     e WiFi SDIO conflita. O pinMode() limpa a rota, igual testAllPins()
+//     no menu Configurações > Pinos (que era o workaround que funcionava).
 //   - Zero beginTransaction. transfer() gerencia transação internamente.
 //
 //   Assim, enquanto CC1101 está acordado, GPIO 12-15 ficam travados
@@ -206,10 +209,20 @@ static void spiEnd(void) {
 }
 
 // Libera o bus completamente. Chamado APENAS quando CC1101 vai dormir.
+// CRÍTICO: hspi->end() NÃO limpa a GPIO matrix dos pinos no ESP32.
+// Os pinos continuam roteados pro HSPI liberado, causando conflito
+// com WiFi SDIO. pinMode() limpa essa rota, garantindo que o
+// próximo begin() faça configuração limpa. É o mesmo efeito
+// que testAllPins() no menu Config > Pinos (que fazia funcionar).
 static void spiBusRelease(void) {
     if (spiBusActive) {
         hspi->end();
         spiBusActive = false;
+        // Limpa GPIO matrix dos pinos HSPI
+        pinMode(CC1101_SCK, OUTPUT);   digitalWrite(CC1101_SCK, LOW);
+        pinMode(CC1101_MOSI, OUTPUT);  digitalWrite(CC1101_MOSI, LOW);
+        pinMode(CC1101_MISO, INPUT);
+        pinMode(CC1101_CSN, OUTPUT);   digitalWrite(CC1101_CSN, HIGH);
     }
 }
 
