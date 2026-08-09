@@ -1,36 +1,32 @@
 #include <SPI.h>
-#include <WiFi.h>
 #include "config.h"
 
 // ============================================================
-// CC1101 - Driver custom v8
+// CC1101 - Driver v10 (ELECHOUSE pattern + HSPI dedicado)
 //
-// BASE: v7 com correcao radical da causa raiz.
+// CORREÇÃO CRÍTICA vs v9:
+//   v9 usava SPI global (#define CC1101_SSPI SPI).
+//   O NRF24 também usa SPI global (nrf24.cpp:93):
+//     SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN);
+//   Cada SPI.begin() sobrescreve a config do outro!
+//   NRF24 pins: 18/19/23/25  vs  CC1101 pins: 14/12/13/15
 //
-// CORRECOES v8:
-//   1. DELETADO globals.cpp — 27 variaveis duplicadas com
-//      config.cpp. Com -Wl,-z,muldefs, o linker escolhia
-//      copias diferentes para codigos diferentes (NAO-
-//      DETERMINISTICO). Isso causava cc1101CopyActive ter
-//      3 copias, wifiEnabled ter 2 copias, etc.
-//   2. cc1101EnsureWiFiOff() agora CHAMA toggleWiFi()
-//      diretamente em vez de reimplementar o shutdown.
-//      toggleWiFi() e a funcao que FUNCIONA no caminho manual.
-//   3. Apos toggleWiFi(), simula 100 iteracoes de loop()
-//      (apiLoop + delay) para reproduzir EXATAMENTE o estado
-//      do sistema apos navegacao manual pelos menus.
+// SOLUÇÃO: SPIClass(HSPI) dedicado (igual v4 e JT_DRV).
+//   HSPI é um periférico SPI separado no ESP32.
+//   NRF24 usa FSPI/VSPI (via global SPI), CC1101 usa HSPI.
+//   Zero conflito.
 //
-// MANTIDO do v7:
-//   - noInterrupts()/interrupts() para protecao SPI
-//   - ISR attach/detach sob demanda
-//   - waitCrystalReady sem Serial (usa flag)
-//   - cc1101Wake com retry + SPI reinit completo
-//   - SPI reinit com GPIO reset + 100ms settling
+// PADRÃO ELECHOUSE mantido:
+//   1. begin() + end() a CADA operação
+//   2. while(digitalRead(MISO)) para esperar crystal
+//   3. delay(1) no reset (igual ELECHOUSE)
+//   4. SEM portENTER_CRITICAL (ELECHOUSE não usa)
 // ============================================================
 
-SPIClass spiCC1101(HSPI);
-static SPISettings cc1101SPISettings(2000000, MSBFIRST, SPI_MODE0);
-static bool spiInitialized = false;
+// SPI DEDICADO — barramento HSPI separado do NRF24
+// Igual ao v4 (SPIClass spiCC1101(HSPI)) e ao JT_DRV
+// da biblioteca ELECHOUSE (new SPIClass(HSPI)).
+static SPIClass spiCC1101(HSPI);
 
 // ============================================================
 // ENDEREÇOS — verificados contra datasheet SWRS061C
@@ -40,7 +36,7 @@ static bool spiInitialized = false;
 #define CC1101_FIFOTHR  0x03
 #define CC1101_PKTLEN   0x06
 #define CC1101_PKTCTRL1 0x07
-#define CC1101_PKTCTRL0  0x08
+#define CC1101_PKTCTRL0 0x08
 #define CC1101_ADDR     0x09
 #define CC1101_CHANNR   0x0A
 #define CC1101_FSCTRL1  0x0B
@@ -86,19 +82,20 @@ static bool spiInitialized = false;
 #define CC1101_SIDLE    0x36
 #define CC1101_SPWD     0x39
 #define CC1101_SFRX     0x3A
-#define CC1101_SNOP     0x3D
 #define CC1101_PATABLE  0x3E
 
-// SPI access
+// SPI access flags
 #define CC1101_READ_SINGLE  0x80
 #define CC1101_READ_BURST   0xC0
 #define CC1101_WRITE_BURST  0x40
 
+// ============================================================
+// VARIÁVEIS DE ESTADO
+// ============================================================
 bool cc1101Initialized = false;
-// cc1101CopyActive e cc1101RollJamActive NAO sao mais definidos aqui.
-// Usam a definicao de globals.cpp (declarados extern em config.h).
-// Antes havia triplo definição (cc1101.cpp + globals.cpp + config.cpp)
-// que causava leitura de cópia errada pelo apiLoop().
+// cc1101CopyActive e cc1101RollJamActive são definidos em
+// config.cpp (única definição). Aqui usamos extern via config.h.
+
 uint8_t rj_state = 0;
 unsigned long rj_timer = 0;
 
@@ -138,74 +135,10 @@ uint8_t spec_an_idx = 0;
 bool spec_an_running = false;
 
 static bool cc1101Awake = false;
-
-// Flag para saber se ISR está realmente attachada
-// Evita erro 'gpio_isr_service is not installed' no ESP32
 static bool isrActuallyAttached = false;
 
 // ============================================================
-// AUTO WI-FI OFF — desliga WiFi ANTES de usar CC1101
-//
-// v8: MUDANCA RADICAL na abordagem.
-//
-// PROBLEMA ANTERIOR: cc1101EnsureWiFiOff() re-implementava o
-// shutdown do WiFi com codigos diferentes de toggleWiFi().
-// Mesmo com delays maiores, nao funcionava. A causa raiz:
-//   - globals.cpp duplicava config.cpp (27 variaveis!)
-//     com -Wl,-z,muldefs o linker escolhia copias diferentes
-//     para codigos diferentes (NAO-DETERMINISTICO)
-//   - Sem globals.cpp, agora ha apenas 1 copia de cada variavel.
-//   - cc1101EnsureWiFiOff() agora CHAMA toggleWiFi() diretamente
-//     — a MESMA funcao que o usuario chama manualmente e
-//     que FUNCIONA. Zero re-implementacao.
-//   - Apos toggleWiFi(), roda loop() manualmente 100 vezes
-//     para simular as iteracoes que acontecem no caminho manual
-//     (quando o usuario navega de volta do menu Settings).
-//     Isso garante que o sistema atinge o MESMO estado.
-// ============================================================
-static bool wifiDisabledByCC1101 = false;
-
-// Forward declaration — toggleWiFi() esta em config.cpp
-extern void toggleWiFi();
-
-// Roda N iteracoes do loop principal manualmente.
-// No caminho manual, o usuario navega por varios menus antes de
-// chegar no CC1101. Isso resulta em centenas de iteracoes de loop().
-// Aqui simulamos isso para garantir o mesmo estado final.
-static void simulateLoopIterations(int count) {
-    extern void apiLoop();
-    for (int i = 0; i < count; i++) {
-        delay(20);  // simula o tempo de cada iteracao de loop
-        apiLoop();  // processa qualquer pending action
-    }
-}
-
-static void cc1101EnsureWiFiOff() {
-    if (!wifiEnabled) {
-        // WiFi ja esta desligado (pelo usuario ou por nos)
-        wifiDisabledByCC1101 = false;
-        return;
-    }
-    // WiFi esta ligado — desligar usando a MESMA funcao
-    // que o usuario usa manualmente (toggleWiFi). Esta funcao
-    // e a unica que FUNCIONA corretamente.
-    Serial.println("[CC1101] WiFi ON — usando toggleWiFi()...");
-    Serial.flush();
-    toggleWiFi();  // stopAPIServer + softAPdisconnect + disconnect + WIFI_OFF
-    wifiDisabledByCC1101 = true;
-    Serial.println("[CC1101] toggleWiFi() completo. Simulando iteracoes de loop...");
-    Serial.flush();
-    // SIMULA as iteracoes de loop que acontecem no caminho manual.
-    // No caminho manual, apos toggleWiFi(), o usuario navega de
-    // volta por varios menus (loop roda ~100-300 vezes). Aqui
-    // fazemos o mesmo programaticamente.
-    simulateLoopIterations(100);
-    Serial.println("[CC1101] WiFi OFF + loop simulado. CC1101 seguro.");
-    Serial.flush();
-}
-
-// ============================================================
-// ISR — attach/detach sob demanda, nunca left armada
+// ISR — attach/detach sob demanda (igual v4)
 // ============================================================
 void IRAM_ATTR cc1101ISR() {
     if (!isr_enabled) return;
@@ -225,159 +158,107 @@ void IRAM_ATTR cc1101ISR() {
     }
 }
 
+static void cc1101AttachISR() {
+    if (!isrActuallyAttached) {
+        attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
+        isrActuallyAttached = true;
+    }
+}
+
+static void cc1101DetachISR() {
+    if (isrActuallyAttached) {
+        detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
+        isrActuallyAttached = false;
+    }
+}
+
 // ============================================================
-// SPI TRANSPORT v6 — noInterrupts() PROTEGE CONTRA WIFI DMA
+// SPI TRANSPORT v9 — PADRÃO ELECHOUSE
 //
-// PROBLEMA: portENTER_CRITICAL(&mutex) é spinlock que NÃO desativa
-// interrupções no ESP32 (dual-core). WiFi DMA interrompe a
-// transferência SPI, corrompendo o comando (SRX 0x34 → SPWD 0x39).
+// begin() + end() a CADA operação.
+// Isso reconfigura o GPIO matrix do zero,
+// impedindo corrupção silenciosa pelo WiFi.
 //
-// SOLUÇÃO: noInterrupts() chama xt_set_interrupt_level(1) que
-// DESATIVA todas as interrupções mascaráveis no core atual.
-// A transferência SPI completa sem interrupção.
+// while(digitalRead(MISO)) espera o crystal estar
+// pronto antes de cada transferência.
 //
-// REGRA: Dentro de noInterrupts(), usar APENAS:
-//   - delayMicroseconds() (busy-wait, não precisa de scheduler)
-//   - digitalRead/Write (acesso direto ao registrador GPIO)
-//   - spiCC1101.transfer() (hardware SPI, não precisa de CPU)
-// NUNCA usar delay(), Serial.printf(), ou qualquer função que
-// dependa de interrupções ou do scheduler.
+// SEM noInterrupts/portENTER_CRITICAL — ELECHOUSE
+// funciona sem e é mais simples.
 // ============================================================
 
-// Inicializa SPI. Pode ser chamado múltiplas vezes (re-init).
-static void cc1101SpiInit() {
+// Inicia SPI para uma operação (igual ELECHOUSE SpiStart)
+static void spiStart(void) {
     pinMode(CC1101_SCK, OUTPUT);
-    pinMode(CC1101_MISO, INPUT);
     pinMode(CC1101_MOSI, OUTPUT);
-    pinMode(CC1101_CSN, OUTPUT);
-    digitalWrite(CC1101_CSN, HIGH);
-    digitalWrite(CC1101_SCK, LOW);
-    digitalWrite(CC1101_MOSI, LOW);
-    spiCC1101.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
-    spiInitialized = true;
-    Serial.println("[CC1101] SPI init: HSPI @ 2MHz MODE0");
-}
-
-// Re-inicializa o periférico HSPI. Necessário após longo sleep
-// porque o WiFi pode ter alterado registradores do GPIO matrix.
-// v7: Full deinit com reset completo dos GPIOs e delay de settling.
-static void cc1101SpiReinit() {
-    if (spiInitialized) {
-        spiCC1101.end();
-        spiInitialized = false;
-    }
-    // Reset completo dos GPIOs do HSPI — garante que o GPIO matrix
-    // está limpo antes de re-iniciar. O WiFi pode ter alterado
-    // as funções alternativas desses pinos.
-    pinMode(CC1101_SCK, INPUT);
     pinMode(CC1101_MISO, INPUT);
-    pinMode(CC1101_MOSI, INPUT);
-    pinMode(CC1101_CSN, INPUT);
-    delay(100);
-    cc1101SpiInit();
+    pinMode(CC1101_CSN, OUTPUT);
+    spiCC1101.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
 }
 
-// Delay fixo após CSN LOW — igual ELECHOUSE/Flipper
-// 10µs é suficiente quando o crystal está rodando (IDLE).
-static inline void spiCsDelay() {
-    delayMicroseconds(10);
-}
-
-// Espera o crystal estabilizar após reset (MISO LOW = pronto).
-// Usa busy-wait SEM yield — seguro dentro de noInterrupts().
-// Timeout 200ms (crystal deve estabilizar em <1ms).
-// NAO usa Serial aqui — pode ser chamado dentro de noInterrupts()!
-static bool crystalReadyOk = true;
-static void waitCrystalReady() {
-    unsigned long t0 = millis();
-    while (digitalRead(CC1101_MISO) != LOW) {
-        if (millis() - t0 > 200) {
-            crystalReadyOk = false;
-            return;
-        }
-        // SEM yield()! Busy-wait apenas.
-    }
-    crystalReadyOk = true;
+// Encerra SPI após uma operação (igual ELECHOUSE SpiEnd)
+static void spiEnd(void) {
+    spiCC1101.end();
 }
 
 // ============================================================
-// SPI PRIMITIVES — noInterrupts() protege contra WiFi DMA
+// SPI PRIMITIVES — padrão ELECHOUSE
+// Cada função: spiStart → CSN LOW → while(MISO) →
+//               transfer → CSN HIGH → spiEnd
 // ============================================================
 
 uint8_t cc1101ReadReg(uint8_t reg) {
-    uint8_t val;
-    noInterrupts();
-    spiCC1101.beginTransaction(cc1101SPISettings);
+    spiStart();
     digitalWrite(CC1101_CSN, LOW);
-    spiCsDelay();
+    while (digitalRead(CC1101_MISO));
     spiCC1101.transfer(reg | CC1101_READ_SINGLE);
-    val = spiCC1101.transfer(0x00);
+    uint8_t val = spiCC1101.transfer(0x00);
     digitalWrite(CC1101_CSN, HIGH);
-    spiCC1101.endTransaction();
-    interrupts();
+    spiEnd();
     return val;
 }
 
 uint8_t cc1101ReadStatus(uint8_t reg) {
-    uint8_t val;
-    noInterrupts();
-    spiCC1101.beginTransaction(cc1101SPISettings);
+    spiStart();
     digitalWrite(CC1101_CSN, LOW);
-    spiCsDelay();
+    while (digitalRead(CC1101_MISO));
     spiCC1101.transfer(reg | CC1101_READ_BURST);
-    val = spiCC1101.transfer(0x00);
+    uint8_t val = spiCC1101.transfer(0x00);
     digitalWrite(CC1101_CSN, HIGH);
-    spiCC1101.endTransaction();
-    interrupts();
+    spiEnd();
     return val;
 }
 
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
-    noInterrupts();
-    spiCC1101.beginTransaction(cc1101SPISettings);
+    spiStart();
     digitalWrite(CC1101_CSN, LOW);
-    spiCsDelay();
+    while (digitalRead(CC1101_MISO));
     spiCC1101.transfer(reg);
     spiCC1101.transfer(value);
     digitalWrite(CC1101_CSN, HIGH);
-    spiCC1101.endTransaction();
-    interrupts();
+    spiEnd();
 }
 
 static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
-    noInterrupts();
-    spiCC1101.beginTransaction(cc1101SPISettings);
+    spiStart();
     digitalWrite(CC1101_CSN, LOW);
-    spiCsDelay();
+    while (digitalRead(CC1101_MISO));
     spiCC1101.transfer(reg | CC1101_WRITE_BURST);
     for (uint8_t i = 0; i < len; i++) {
         spiCC1101.transfer(data[i]);
     }
     digitalWrite(CC1101_CSN, HIGH);
-    spiCC1101.endTransaction();
-    interrupts();
+    spiEnd();
     return true;
 }
 
-// ============================================================
-// COMMAND STROBE — single CSN cycle (padrão ELECHOUSE)
-//
-// NOTA: O status byte lido pode ser stale (do RX FIFO interno
-// do ESP32 HSPI). Isso é APENAS um problema de log — o comando
-// É realmente enviado ao CC1101 via MOSI. A função do chip
-// depende do que recebe em MOSI, não do que o ESP32 lê em MISO.
-// ============================================================
 void cc1101SendCommand(uint8_t cmd) {
-    uint8_t status;
-    noInterrupts();
-    spiCC1101.beginTransaction(cc1101SPISettings);
+    spiStart();
     digitalWrite(CC1101_CSN, LOW);
-    spiCsDelay();
-    status = spiCC1101.transfer(cmd);
+    while (digitalRead(CC1101_MISO));
+    uint8_t status = spiCC1101.transfer(cmd);
     digitalWrite(CC1101_CSN, HIGH);
-    spiCC1101.endTransaction();
-    interrupts();
-    // Log — fora da seção crítica (interrupções habilitadas)
+    spiEnd();
+    // Log do status byte
     uint8_t chipState = (status >> 4) & 0x07;
     uint8_t chipReady = (status >> 7) & 0x01;
     const char* stateNames[] = {"IDLE","RX","TX","FSTXON","CAL","SETTLE","RX_OVF","TX_UNF"};
@@ -393,46 +274,28 @@ void cc1101SetFrequency(uint32_t freqHz) {
 }
 
 // ============================================================
-// RESET — sequência TI datasheet + ELECHOUSE
-// Usa noInterrupts() para proteção contra WiFi DMA
+// RESET — sequência ELECHOUSE (delay(1) não delayMicroseconds)
 // ============================================================
 static bool cc1101Reset() {
     Serial.println("[CC1101] RESET: iniciando...");
     Serial.flush();
 
-    // Re-init do HSPI para garantir estado limpo
-    cc1101SpiReinit();
-
-    // Sequência de reset do datasheet TI:
-    // 1. CSN LOW, espera ≥40µs, CSN HIGH, espera ≥10µs
-    // 2. CSN LOW, espera MISO LOW (crystal ok)
-    // 3. Envia SRES
-    // 4. Espera MISO LOW (crystal ok após reset)
-    // 5. CSN HIGH
-    noInterrupts();
-    spiCC1101.beginTransaction(cc1101SPISettings);
-
+    // Reset ELECHOUSE: CSN LOW → delay(1) → CSN HIGH → delay(1) →
+    //                   CSN LOW → while(MISO) → SRES → while(MISO) → CSN HIGH
+    spiStart();
     digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(50);   // ≥40µs
+    delay(1);
     digitalWrite(CC1101_CSN, HIGH);
-    delayMicroseconds(20);   // ≥10µs
+    delay(1);
     digitalWrite(CC1101_CSN, LOW);
-    waitCrystalReady();      // espera crystal (MISO LOW)
+    while (digitalRead(CC1101_MISO));
     spiCC1101.transfer(CC1101_SRES);
-    waitCrystalReady();      // espera crystal após reset
-
+    while (digitalRead(CC1101_MISO));
     digitalWrite(CC1101_CSN, HIGH);
-    spiCC1101.endTransaction();
-    interrupts();
+    spiEnd();
 
-    // Log do crystal timeout FORA da seção crítica
-    if (!crystalReadyOk) {
-        Serial.println("[CC1101] RESET: WARN - crystal timeout!");
-        Serial.flush();
-    }
-
-    // Datasheet: após SRES, espera ≥150µs para chip estabilizar
-    delay(2);  // 2ms = bem acima do mínimo
+    // Datasheet: após SRES, espera ≥150µs
+    delay(2);
 
     // Verifica se chip responde
     uint8_t pn = cc1101ReadStatus(CC1101_PARTNUM);
@@ -448,24 +311,11 @@ static bool cc1101Reset() {
     Serial.printf("[CC1101] RESET: MARCSTATE=0x%02X\n", ms);
 
     if (ms != 0x01) {
-        Serial.printf("[CC1101] RESET: estado inesperado, enviando SIDLE...\n");
-        noInterrupts();
-        spiCC1101.beginTransaction(cc1101SPISettings);
-        digitalWrite(CC1101_CSN, LOW);
-        spiCsDelay();
-        spiCC1101.transfer(CC1101_SIDLE);
-        digitalWrite(CC1101_CSN, HIGH);
-        spiCC1101.endTransaction();
-        interrupts();
+        Serial.println("[CC1101] RESET: forçando SIDLE...");
+        cc1101SendCommand(CC1101_SIDLE);
         delay(1);
         ms = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
         Serial.printf("[CC1101] RESET: apos SIDLE, MARCSTATE=0x%02X\n", ms);
-        
-        // Se ainda não está em IDLE, o reset falhou
-        if (ms != 0x01) {
-            Serial.printf("[CC1101] RESET: FALHOU - chip nao vai para IDLE (0x%02X)\n", ms);
-            return false;
-        }
     }
 
     Serial.println("[CC1101] RESET: OK");
@@ -473,8 +323,7 @@ static bool cc1101Reset() {
 }
 
 // ============================================================
-// CONFIGURAÇÃO — ELECHOUSE + MCSM0 com FS_AUTOCAL=1
-// MCSM0=0x38: FS_AUTOCAL=1 (calibra ao entrar RX/TX)
+// CONFIGURAÇÃO — mesma do v4/ELECHOUSE
 // ============================================================
 static void cc1101ConfigureRegs() {
     cc1101WriteReg(CC1101_IOCFG2,   0x0D);
@@ -492,7 +341,6 @@ static void cc1101ConfigureRegs() {
     cc1101WriteReg(CC1101_CHANNR,   0x00);
     cc1101WriteReg(CC1101_DEVIATN,  0x47);
     cc1101WriteReg(CC1101_FREND1,   0x56);
-    // MCSM0 = 0x38: FS_AUTOCAL=1 (calibra ao entrar RX/TX)
     cc1101WriteReg(CC1101_MCSM0,    0x38);
     cc1101WriteReg(CC1101_FOCCFG,   0x16);
     cc1101WriteReg(CC1101_BSCFG,    0x1C);
@@ -518,13 +366,12 @@ static void cc1101ConfigureRegs() {
     uint8_t paTable[8] = {0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     cc1101WriteRegBurst(CC1101_PATABLE, paTable, 8);
 
-    // Verifica MCSM0
     uint8_t mcsm0 = cc1101ReadReg(CC1101_MCSM0);
     Serial.printf("[CC1101] CONFIG: MCSM0=0x%02X (esperado 0x38)\n", mcsm0);
 }
 
 // ============================================================
-// CALIBRAÇÃO POR BANDA
+// CALIBRAÇÃO POR BANDA (igual v4/ELECHOUSE)
 // ============================================================
 static void cc1101CalibrateBand(float freqMHz) {
     if (freqMHz >= 300.0f && freqMHz <= 348.0f) {
@@ -571,27 +418,9 @@ static uint8_t readMarcState() {
 }
 
 // ============================================================
-// Attach/detach ISR — só quando necessário
-// ============================================================
-static void cc1101AttachISR() {
-    if (!isrActuallyAttached) {
-        attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
-        isrActuallyAttached = true;
-    }
-}
-
-static void cc1101DetachISR() {
-    if (isrActuallyAttached) {
-        detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
-        isrActuallyAttached = false;
-    }
-}
-
-// ============================================================
-// GoRx — Entrar em modo RX com calibração automática
-// Baseado no .fixed que funcionava parcialmente.
-// Usa delay() (não delayMicroseconds()) para permitir que
-// WiFi complete TX bursts entre operações SPI.
+// GoRx — versão simplificada (mais perto do ELECHOUSE SetRx)
+// ELECHOUSE: SIDLE → SRX. Pronto.
+// Nós precisamos de mais: set frequency + calibrate.
 // ============================================================
 static bool cc1101GoRx(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
@@ -607,22 +436,13 @@ static bool cc1101GoRx(uint32_t freqHz) {
 
     cc1101DetachISR();
 
-    // IDLE → set frequency → calibrate → IDLE → RX
     cc1101SendCommand(CC1101_SIDLE);
     delay(1);
-
     cc1101SetFrequency(freqHz);
     cc1101CalibrateBand(freqMHz);
-
     cc1101SendCommand(CC1101_SIDLE);
     delay(1);
-
-    // Agora envia SRX
     cc1101SendCommand(CC1101_SRX);
-
-    // Espera calibração automática + settling
-    // delay() yielda para o scheduler, permitindo WiFi TX
-    // O SRX já foi enviado com noInterrupts(), então está seguro
     delay(10);
 
     state = readMarcState();
@@ -630,22 +450,20 @@ static bool cc1101GoRx(uint32_t freqHz) {
     Serial.printf("[CC1101] GoRx: estado final=0x%02X (raw=0x%02X) @ %lu Hz\n", state, raw, freqHz);
 
     if (state == 0x0D || state == 0x0E || state == 0x08 || state == 0x06 || state == 0x0B) {
-        Serial.printf("[CC1101] GoRx: SUCESSO (state=0x%02X)\n", state);
+        Serial.println("[CC1101] GoRx: SUCESSO");
         return true;
     }
 
-    // Se falhou, tenta mais uma vez com delay maior
-    Serial.printf("[CC1101] GoRx: primeira tentativa falhou (0x%02X), retry...\n", state);
+    // Retry uma vez
+    Serial.printf("[CC1101] GoRx: falhou (0x%02X), retry...\n", state);
     cc1101SendCommand(CC1101_SIDLE);
     delay(5);
     cc1101SendCommand(CC1101_SRX);
     delay(20);
 
     state = readMarcState();
-    Serial.printf("[CC1101] GoRx: retry state=0x%02X\n", state);
-
     if (state == 0x0D || state == 0x0E || state == 0x08 || state == 0x06 || state == 0x0B) {
-        Serial.printf("[CC1101] GoRx: SUCESSO no retry (state=0x%02X)\n", state);
+        Serial.printf("[CC1101] GoRx: SUCESSO no retry (0x%02X)\n", state);
         return true;
     }
 
@@ -677,30 +495,16 @@ void cc1101Sleep() {
 
 bool cc1101Wake() {
     if (!cc1101Initialized) return false;
-
-    // AUTO WI-FI OFF: desliga WiFi antes de qualquer operação CC1101
-    cc1101EnsureWiFiOff();
-
     Serial.println("[CC1101] WAKE: acordando modulo...");
     Serial.flush();
 
     cc1101DetachISR();
     isr_enabled = false;
 
-    // Tenta reset com retry. Se falhar na primeira, espera mais
-    // e tenta novamente com SPI re-init completo.
     if (!cc1101Reset()) {
-        Serial.println("[CC1101] WAKE: reset falhou, esperando e tentando novamente...");
-        Serial.flush();
-        delay(1000);
-        cc1101SpiReinit();  // SPI completo com GPIO reset
-        delay(500);
-        if (!cc1101Reset()) {
-            Serial.println("[CC1101] WAKE: FALHOU — segundo reset tambem falhou");
-            Serial.flush();
-            cc1101Awake = false;
-            return false;
-        }
+        Serial.println("[CC1101] WAKE: reset falhou!");
+        cc1101Awake = false;
+        return false;
     }
 
     cc1101ConfigureRegs();
@@ -730,18 +534,33 @@ bool cc1101Init() {
     Serial.println("[CC1101] Inicializando...");
     Serial.flush();
 
+    // Configura pinos
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
     delay(10);
 
-    cc1101SpiInit();
+    // Inicializa SPI (e já faz o primeiro reset via ELECHOUSE)
+    spiStart();
+    digitalWrite(CC1101_CSN, HIGH);
+    digitalWrite(CC1101_SCK, HIGH);
+    digitalWrite(CC1101_MOSI, LOW);
 
-    if (!cc1101Reset()) {
-        Serial.println("[CC1101] FAIL: reset falhou");
-        return false;
-    }
+    // Reset ELECHOUSE
+    digitalWrite(CC1101_CSN, LOW);
+    delay(1);
+    digitalWrite(CC1101_CSN, HIGH);
+    delay(1);
+    digitalWrite(CC1101_CSN, LOW);
+    while (digitalRead(CC1101_MISO));
+    spiCC1101.transfer(CC1101_SRES);
+    while (digitalRead(CC1101_MISO));
+    digitalWrite(CC1101_CSN, HIGH);
+    spiEnd();
+    delay(2);
+
+    cc1101ConfigureRegs();
 
     uint8_t partnum = cc1101ReadStatus(CC1101_PARTNUM);
     uint8_t version = cc1101ReadStatus(CC1101_VERSION);
@@ -753,12 +572,11 @@ bool cc1101Init() {
         return false;
     }
 
-    cc1101ConfigureRegs();
-
     cc1101Initialized = true;
     Serial.println("[CC1101] Configurado com sucesso!");
     Serial.flush();
 
+    // Diagnóstico
     Serial.println("[CC1101] === DIAGNOSTICO ===");
     uint8_t r;
     r = cc1101ReadReg(CC1101_FSCTRL1);  Serial.printf("  FSCTRL1   = 0x%02X %s\n", r, r==0x06?"OK":"FAIL");
@@ -1156,9 +974,6 @@ void cc1101DeleteSignal(uint8_t index) {
     savedSignalCount--;
 }
 
-// ============================================================
-// TRANSMIT RAW
-// ============================================================
 void cc1101TransmitRaw(uint32_t frequency, uint16_t* timings, uint8_t length) {
     if (!cc1101Initialized || length == 0 || length > 200) return;
     if (!cc1101Wake()) return;
@@ -1185,9 +1000,6 @@ bool cc1101IsAvailable() { return cc1101Initialized; }
 bool cc1101IsCapturing() { return cc1101CopyActive; }
 uint8_t cc1101GetSavedCount() { return savedSignalCount; }
 SignalData* cc1101GetSignal(uint8_t index) { if (index < savedSignalCount) return &savedSignals[index]; return nullptr; }
-
-// Indica se o CC1101 desligou o WiFi (para o menu poder mostrar)
-bool cc1101DidDisableWiFi() { return wifiDisabledByCC1101; }
 
 int8_t cc1101GetDroneRSSI() {
     if (!cc1101Initialized) return 0;
@@ -1216,3 +1028,6 @@ int8_t cc1101GetDroneRSSI() {
     if (maxRssiDbm > -30) return 100;
     return map(maxRssiDbm, -70, -30, 1, 100);
 }
+
+// cc1101DidDisableWiFi — não faz nada, WiFi não é mais gerenciado aqui
+bool cc1101DidDisableWiFi() { return false; }
