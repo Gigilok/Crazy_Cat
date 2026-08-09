@@ -9,9 +9,11 @@
 //      tarefa WiFi com CSN LOW, corrompendo SPI.
 //   2. Substituído por delayMicroseconds fixo (igual ELECHOUSE
 //      e Flipper Zero subghz driver).
-//   3. CRITICAL SECTIONS REMOVIDAS — beginTransaction/endTransaction
-//      já fazem locking do SPI bus no ESP32. portENTER_CRITICAL
-//      sem argumento não compila no ESP-IDF 4.4+ (exige portMUX_TYPE*).
+//   3. CRITICAL SECTIONS com portMUX_TYPE — beginTransaction/endTransaction
+//      NÃO desativam interrupções no ESP32. WiFi AP gera interrupções
+//      DMA a cada ~100µs. Sem proteção, interrupção durante CSN LOW
+//      corrompe o comando SPI (SRX 0x34 vira SPWD 0x39 por exemplo).
+//      ESP-IDF 4.4+ exige portMUX_TYPE* como argumento.
 //   4. Re-init completo do SPI (end+begin) no wake — garante
 //      que o periférico HSPI está limpo após longo sleep.
 //   5. attachInterrupt REMOVIDO do wake — a ISR ficava armada
@@ -24,6 +26,9 @@
 SPIClass spiCC1101(HSPI);
 static SPISettings cc1101SPISettings(2000000, MSBFIRST, SPI_MODE0);
 static bool spiInitialized = false;
+
+// Mutex para critical sections — ESP-IDF 4.4+ requer portMUX_TYPE*
+static portMUX_TYPE cc1101SpiMutex = portMUX_INITIALIZER_UNLOCKED;
 
 // ============================================================
 // ENDEREÇOS — verificados contra datasheet SWRS061C
@@ -217,6 +222,7 @@ static void waitCrystalReady() {
 
 uint8_t cc1101ReadReg(uint8_t reg) {
     uint8_t val;
+    portENTER_CRITICAL(&cc1101SpiMutex);
     spiCC1101.beginTransaction(cc1101SPISettings);
     digitalWrite(CC1101_CSN, LOW);
     spiCsDelay();
@@ -224,11 +230,13 @@ uint8_t cc1101ReadReg(uint8_t reg) {
     val = spiCC1101.transfer(0x00);
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
+    portEXIT_CRITICAL(&cc1101SpiMutex);
     return val;
 }
 
 uint8_t cc1101ReadStatus(uint8_t reg) {
     uint8_t val;
+    portENTER_CRITICAL(&cc1101SpiMutex);
     spiCC1101.beginTransaction(cc1101SPISettings);
     digitalWrite(CC1101_CSN, LOW);
     spiCsDelay();
@@ -236,10 +244,12 @@ uint8_t cc1101ReadStatus(uint8_t reg) {
     val = spiCC1101.transfer(0x00);
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
+    portEXIT_CRITICAL(&cc1101SpiMutex);
     return val;
 }
 
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
+    portENTER_CRITICAL(&cc1101SpiMutex);
     spiCC1101.beginTransaction(cc1101SPISettings);
     digitalWrite(CC1101_CSN, LOW);
     spiCsDelay();
@@ -247,9 +257,11 @@ void cc1101WriteReg(uint8_t reg, uint8_t value) {
     spiCC1101.transfer(value);
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
+    portEXIT_CRITICAL(&cc1101SpiMutex);
 }
 
 static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
+    portENTER_CRITICAL(&cc1101SpiMutex);
     spiCC1101.beginTransaction(cc1101SPISettings);
     digitalWrite(CC1101_CSN, LOW);
     spiCsDelay();
@@ -259,22 +271,26 @@ static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
     }
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
+    portEXIT_CRITICAL(&cc1101SpiMutex);
     return true;
 }
 
 void cc1101SendCommand(uint8_t cmd) {
     uint8_t status;
+    portENTER_CRITICAL(&cc1101SpiMutex);
     spiCC1101.beginTransaction(cc1101SPISettings);
     digitalWrite(CC1101_CSN, LOW);
     spiCsDelay();
     status = spiCC1101.transfer(cmd);
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
-    // Log status byte para TODOS os comandos strobe
+    portEXIT_CRITICAL(&cc1101SpiMutex);
+    // Log status byte — fora da critical section (Serial.printf pode bloquear)
     uint8_t chipState = (status >> 4) & 0x07;
     uint8_t chipReady = (status >> 7) & 0x01;
-    Serial.printf("[CC1101] CMD 0x%02X: status=0x%02X (RDY=%d STATE=%d)\n",
-        cmd, status, chipReady, chipState);
+    const char* stateNames[] = {"IDLE","RX","TX","FSTXON","CAL","SETTLE","RX_OVF","TX_UNF"};
+    Serial.printf("[CC1101] CMD 0x%02X: status=0x%02X (RDY=%d STATE=%s)\n",
+        cmd, status, chipReady, (chipState <= 7) ? stateNames[chipState] : "?");
 }
 
 void cc1101SetFrequency(uint32_t freqHz) {
@@ -301,6 +317,7 @@ static bool cc1101Reset() {
 // 3. Envia SRES
     // 4. Espera MISO LOW (crystal ok após reset)
     // 5. CSN HIGH
+    portENTER_CRITICAL(&cc1101SpiMutex);
     spiCC1101.beginTransaction(cc1101SPISettings);
 
     digitalWrite(CC1101_CSN, LOW);
@@ -314,6 +331,7 @@ static bool cc1101Reset() {
 
     digitalWrite(CC1101_CSN, HIGH);
     spiCC1101.endTransaction();
+    portEXIT_CRITICAL(&cc1101SpiMutex);
 
     // Datasheet: após SRES, espera ≥150µs para chip estabilizar
     delay(2);  // 2ms = bem acima do mínimo
@@ -333,12 +351,14 @@ static bool cc1101Reset() {
 
     if (ms != 0x01) {
         Serial.printf("[CC1101] RESET: estado inesperado, enviando SIDLE...\n");
+        portENTER_CRITICAL(&cc1101SpiMutex);
         spiCC1101.beginTransaction(cc1101SPISettings);
         digitalWrite(CC1101_CSN, LOW);
         spiCsDelay();
         spiCC1101.transfer(CC1101_SIDLE);
         digitalWrite(CC1101_CSN, HIGH);
         spiCC1101.endTransaction();
+        portEXIT_CRITICAL(&cc1101SpiMutex);
         delay(1);
         ms = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
         Serial.printf("[CC1101] RESET: apos SIDLE, MARCSTATE=0x%02X\n", ms);
