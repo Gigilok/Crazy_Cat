@@ -3,30 +3,29 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 - Driver custom v7
+// CC1101 - Driver custom v8
 //
-// BASE: Versão v6 (que funcionava com WiFi OFF manual)
-// CORREÇÕES v7:
-//   1. REMOVIDAS variáveis duplicadas (cc1101CopyActive,
-//      cc1101RollJamActive). Antes definidas em cc1101.cpp +
-//      globals.cpp + config.cpp (3 cópias!). O apiLoop()
-//      lia a cópia errada, chamando cc1101CaptureLoop()
-//      quando não devia. Agora usa extern do config.h.
-//   2. WiFi OFF: delay aumentado de 1.5s para 3s. O PA do
-//      WiFi (~300mA) precisa de mais tempo para descarregar.
-//   3. Settling check: se WiFi foi desligado há menos de 2s,
-//      espera o restante antes de operar CC1101.
-//   4. SPI reinit: agora faz reset completo dos GPIOs (INPUT)
-//      + 100ms de delay antes de re-iniciar HSPI. O GPIO
-//      matrix pode estar sujo após WiFi OFF.
-//   5. cc1101Wake() com retry: se o primeiro reset falhar,
-//      espera 1s, re-inicia SPI completamente, e tenta
-//      novamente. Resolve o "primeira tentativa falha".
+// BASE: v7 com correcao radical da causa raiz.
 //
-// MANTIDO do v6:
-//   - noInterrupts()/interrupts() para proteção SPI
+// CORRECOES v8:
+//   1. DELETADO globals.cpp — 27 variaveis duplicadas com
+//      config.cpp. Com -Wl,-z,muldefs, o linker escolhia
+//      copias diferentes para codigos diferentes (NAO-
+//      DETERMINISTICO). Isso causava cc1101CopyActive ter
+//      3 copias, wifiEnabled ter 2 copias, etc.
+//   2. cc1101EnsureWiFiOff() agora CHAMA toggleWiFi()
+//      diretamente em vez de reimplementar o shutdown.
+//      toggleWiFi() e a funcao que FUNCIONA no caminho manual.
+//   3. Apos toggleWiFi(), simula 100 iteracoes de loop()
+//      (apiLoop + delay) para reproduzir EXATAMENTE o estado
+//      do sistema apos navegacao manual pelos menus.
+//
+// MANTIDO do v7:
+//   - noInterrupts()/interrupts() para protecao SPI
 //   - ISR attach/detach sob demanda
-//   - Status byte pode ser stale (não afeta função)
+//   - waitCrystalReady sem Serial (usa flag)
+//   - cc1101Wake com retry + SPI reinit completo
+//   - SPI reinit com GPIO reset + 100ms settling
 // ============================================================
 
 SPIClass spiCC1101(HSPI);
@@ -147,53 +146,61 @@ static bool isrActuallyAttached = false;
 // ============================================================
 // AUTO WI-FI OFF — desliga WiFi ANTES de usar CC1101
 //
-// PROBLEMA: WiFi AP TX beacons a cada ~100µs. O pico de corrente
-// (~300mA) do PA causa EMI no GPIO 13 (MOSI), corrompendo os
-// comandos SPI. SRX (0x34) vira SPWD (0x39) e o chip vai pra SLEEP.
-// Mesmo com noInterrupts(), a EMI física não é bloqueada.
+// v8: MUDANCA RADICAL na abordagem.
 //
-// SOLUÇÃO: Desligar WiFi completamente (WIFI_OFF) antes de
-// qualquer operação CC1101. O flag wifiDisabledByCC1101 evita
-// desligar repetidamente, e indica que o CC1101 desligou o WiFi.
-//
-// v7: Apos WiFi.mode(WIFI_OFF), espera 3s (era 1.5s) para
-// o PA do WiFi descarregar e a fonte estabilizar. Depois faz
-// um full SPI deinit com reset dos GPIOs e delay de 500ms
-// antes de re-iniciar o HSPI.
+// PROBLEMA ANTERIOR: cc1101EnsureWiFiOff() re-implementava o
+// shutdown do WiFi com codigos diferentes de toggleWiFi().
+// Mesmo com delays maiores, nao funcionava. A causa raiz:
+//   - globals.cpp duplicava config.cpp (27 variaveis!)
+//     com -Wl,-z,muldefs o linker escolhia copias diferentes
+//     para codigos diferentes (NAO-DETERMINISTICO)
+//   - Sem globals.cpp, agora ha apenas 1 copia de cada variavel.
+//   - cc1101EnsureWiFiOff() agora CHAMA toggleWiFi() diretamente
+//     — a MESMA funcao que o usuario chama manualmente e
+//     que FUNCIONA. Zero re-implementacao.
+//   - Apos toggleWiFi(), roda loop() manualmente 100 vezes
+//     para simular as iteracoes que acontecem no caminho manual
+//     (quando o usuario navega de volta do menu Settings).
+//     Isso garante que o sistema atinge o MESMO estado.
 // ============================================================
 static bool wifiDisabledByCC1101 = false;
-static unsigned long lastWiFiOffTime = 0;
+
+// Forward declaration — toggleWiFi() esta em config.cpp
+extern void toggleWiFi();
+
+// Roda N iteracoes do loop principal manualmente.
+// No caminho manual, o usuario navega por varios menus antes de
+// chegar no CC1101. Isso resulta em centenas de iteracoes de loop().
+// Aqui simulamos isso para garantir o mesmo estado final.
+static void simulateLoopIterations(int count) {
+    extern void apiLoop();
+    for (int i = 0; i < count; i++) {
+        delay(20);  // simula o tempo de cada iteracao de loop
+        apiLoop();  // processa qualquer pending action
+    }
+}
 
 static void cc1101EnsureWiFiOff() {
     if (!wifiEnabled) {
-        // WiFi já está desligado. Verifica se deu tempo de settling.
-        unsigned long elapsed = millis() - lastWiFiOffTime;
-        if (elapsed < 2000) {
-            // Menos de 2s desde o último WiFi off — espera mais
-            Serial.printf("[CC1101] WiFi ja OFF ha apenas %lums, esperando settling...\n", elapsed);
-            Serial.flush();
-            delay(2000 - elapsed);
-        }
+        // WiFi ja esta desligado (pelo usuario ou por nos)
         wifiDisabledByCC1101 = false;
         return;
     }
-    // WiFi está ligado — desligar para operação CC1101
-    Serial.println("[CC1101] WiFi ON detectado — desligando para operacao CC1101...");
+    // WiFi esta ligado — desligar usando a MESMA funcao
+    // que o usuario usa manualmente (toggleWiFi). Esta funcao
+    // e a unica que FUNCIONA corretamente.
+    Serial.println("[CC1101] WiFi ON — usando toggleWiFi()...");
     Serial.flush();
-    stopAPIServer();
-    WiFi.softAPdisconnect(true);
-    WiFi.disconnect(true, true);
-    delay(500);
-    WiFi.mode(WIFI_OFF);
-    // Espera o PA do WiFi descarregar completamente e a fonte estabilizar.
-    // Antes era 1500ms — não era suficiente. Agora 3000ms.
-    Serial.println("[CC1101] Aguardando PA do WiFi descarregar (3s)...");
-    Serial.flush();
-    delay(3000);
-    wifiEnabled = false;
+    toggleWiFi();  // stopAPIServer + softAPdisconnect + disconnect + WIFI_OFF
     wifiDisabledByCC1101 = true;
-    lastWiFiOffTime = millis();
-    Serial.println("[CC1101] WiFi desligado. Settling completo.");
+    Serial.println("[CC1101] toggleWiFi() completo. Simulando iteracoes de loop...");
+    Serial.flush();
+    // SIMULA as iteracoes de loop que acontecem no caminho manual.
+    // No caminho manual, apos toggleWiFi(), o usuario navega de
+    // volta por varios menus (loop roda ~100-300 vezes). Aqui
+    // fazemos o mesmo programaticamente.
+    simulateLoopIterations(100);
+    Serial.println("[CC1101] WiFi OFF + loop simulado. CC1101 seguro.");
     Serial.flush();
 }
 
