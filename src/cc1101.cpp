@@ -13,34 +13,25 @@
 //   que fazia begin()/end(). Após ~20 ciclos, os pinos ficavam
 //   permanentemente corrompidos e todo SPI retornava 0x00.
 //
-// SOLUÇÃO:
-//   - spiStart(): chama hspi->begin(pins) só na PRIMEIRA vez.
-//     Depois disso, usa hspi->beginTransaction() (leve, não
-//     toca na GPIO matrix).
-//   - spiEnd(): só chama hspi->endTransaction() (leve).
-//     NUNCA chama hspi->end() entre transações.
-//   - spiBusRelease(): nova função que faz endTransaction()+end().
-//     Chamada APENAS quando CC1101 vai para SLEEP.
+// SOLUÇÃO v12.1:
+//   - spiStart(): chama hspi->begin(pins) só na PRIMEIRA vez. Depois é no-op.
+//   - spiEnd(): NÃO faz nada. Bus HSPI permanece travado nos pinos 12-15.
+//   - spiBusRelease(): chama hspi->end(). Só no cc1101Sleep().
+//   - Zero beginTransaction. transfer() gerencia transação internamente.
 //
-//   Assim, enquanto CC1101 está acordado (capture, replay, etc.),
-//   os pinos GPIO 12-15 ficam TRAVADOS no HSPI e WiFi não
-//   consegue roubar. Quando CC1101 dorme, libera os pinos.
+//   Assim, enquanto CC1101 está acordado, GPIO 12-15 ficam travados
+//   no HSPI via GPIO matrix. WiFi SDIO não consegue roubar os pinos.
+//   Quando CC1101 dorme, spiBusRelease() libera os pinos.
 //
 // PROVA: Com WiFi OFF funciona 100%. Com WiFi ON + este fix,
-//   o bus permanece travado enquanto ativo, igual ao comportamento
-//   com WiFi OFF.
+//   o bus permanece travado enquanto ativo, impedindo roubo dos pinos.
 // ============================================================
 
 // SPI DEDICADO — ponteiro, igual JT_DRV
 static SPIClass* hspi = NULL;
 
 // Flag: o bus HSPI está inicializado (GPIO matrix configurada)?
-// Quando true, spiStart() usa beginTransaction() (leve).
-// Quando false, spiStart() usa begin() (pesado, reconfigura GPIO matrix).
 static bool spiBusActive = false;
-
-// SPISettings para beginTransaction
-static SPISettings cc1101SPISettings(10000000, MSBFIRST, SPI_MODE0);
 
 // ============================================================
 // ENDEREÇOS — verificados contra datasheet SWRS061C
@@ -185,46 +176,38 @@ static void cc1101DetachISR() {
 }
 
 // ============================================================
-// SPI TRANSPORT v12 — BUS PERSISTENTE
+// SPI TRANSPORT v12.1 — BUS PERSISTENTE (sem beginTransaction)
 //
 // PROBLEMA DO v11:
-//   spiStart() = hspi->begin(pins)  (reconfigura GPIO matrix)
-//   spiEnd()   = hspi->end()        (LIBERA GPIO matrix → WiFi rouba)
-//   Cada register read/write fazia begin/end, liberando os pinos
-//   12-15 para WiFi SDIO entre transações.
+//   spiEnd() chamava hspi->end() que libera a GPIO matrix.
+//   WiFi SDIO roubava os pinos 12-15 entre begin/end.
 //
-// v12:
-//   spiStart() = se bus não ativo: hspi->begin(pins) + seta flag
-//                se bus ativo: hspi->beginTransaction(settings) (leve)
-//   spiEnd()   = hspi->endTransaction() (leve, NÃO libera GPIO)
-//   spiBusRelease() = endTransaction() + hspi->end() (libera GPIO)
+// v12.1 (MINIMAL CHANGE from v11):
+//   spiStart() = hspi->begin(pins) só se bus não está ativo.
+//                Se já ativo, não faz nada (GPIO matrix já configurada).
+//   spiEnd()   = NÃO FAZ NADA. Bus permanece travado.
+//                O transfer() do ESP32 cuida de sua própria transação.
+//   spiBusRelease() = hspi->end() só no Sleep.
 //
-//   Resultado: GPIO 12-15 ficam travados no HSPI enquanto CC1101
-//   está acordado. WiFi não consegue roubar.
+//   Zero beginTransaction. O transfer() gerencia transação sozinho.
 // ============================================================
 
 static void spiStart(void) {
     if (!spiBusActive) {
-        // Primeira chamada: inicializa o bus (pesado, reconfigura GPIO matrix)
         hspi->begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
         spiBusActive = true;
-        // Pequeno delay para GPIO matrix estabilizar
-        delayMicroseconds(10);
     }
-    // Transação leve (não toca GPIO matrix)
-    hspi->beginTransaction(cc1101SPISettings);
 }
 
 static void spiEnd(void) {
-    // Só termina a transação (leve). NÃO libera o bus.
-    // Os pinos 12-15 continuam roteados para HSPI.
-    hspi->endTransaction();
+    // NÃO faz nada. O bus HSPI permanece inicializado.
+    // transfer() do ESP32 gerencia beginTransaction/endTransaction internamente.
+    // Os pinos 12-15 ficam travados na GPIO matrix → WiFi não rouba.
 }
 
 // Libera o bus completamente. Chamado APENAS quando CC1101 vai dormir.
 static void spiBusRelease(void) {
     if (spiBusActive) {
-        hspi->endTransaction();
         hspi->end();
         spiBusActive = false;
     }
@@ -523,10 +506,8 @@ bool cc1101Wake() {
     cc1101DetachISR();
     isr_enabled = false;
 
-    // v12: A primeira chamada a spiStart() aqui vai chamar hspi->begin(pins),
-    // reconfigurando a GPIO matrix e roubando os pinos 12-15 do WiFi.
-    // Isso é seguro porque cc1101Reset() chama spiStart() internamente.
-    // Todas as chamadas subsequentes a spiStart() serão beginTransaction (leve).
+    // spiStart() vai chamar hspi->begin(pins) na primeira vez (re-claima GPIO matrix do WiFi).
+    // Depois disso, todas as chamadas a spiStart() são no-op (bus já ativo).
 
     if (!cc1101Reset()) {
         Serial.println("[CC1101] WAKE: reset falhou!");
@@ -556,7 +537,8 @@ bool cc1101Wake() {
         spiBusRelease();
     }
     Serial.flush();
-    // v12: NÃO chama spiBusRelease(). O bus fica travado.
+    // Bus permanece ativo (GPIO matrix travada no HSPI).
+    // WiFi não consegue roubar os pinos 12-15.
     return cc1101Awake;
 }
 
@@ -569,16 +551,12 @@ bool cc1101Init() {
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
 
-    // Inicializa o bus HSPI (reconfigura GPIO matrix)
-    // NÃO usa spiStart() aqui porque spiStart() também abre beginTransaction.
-    // Queremos só o begin(), sem transação aberta.
-    hspi->begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
-    spiBusActive = true;
+    // Inicializa o bus HSPI
+    spiStart();
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
 
-    // Reset manual (agora spiStart() só faz beginTransaction, sem begin)
-    spiStart();
+    // Reset manual (transfer() cuida de transação internamente)
     digitalWrite(CC1101_CSN, LOW);
     delay(1);
     digitalWrite(CC1101_CSN, HIGH);
@@ -588,7 +566,6 @@ bool cc1101Init() {
     hspi->transfer(CC1101_SRES);
     while (digitalRead(CC1101_MISO));
     digitalWrite(CC1101_CSN, HIGH);
-    spiEnd();
     delay(2);
 
     cc1101ConfigureRegs();
