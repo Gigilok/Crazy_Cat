@@ -2,26 +2,21 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 - Driver custom v4
+// CC1101 - Driver custom v5
 //
-// CORREÇÕES CRÍTICAS vs versão v3:
-//   1. cc1101SendCommand: REMOVIDO dummy SNOP + 2 CSN cycles.
-//      A v3 fazia DOIS ciclos CSN dentro de UMA beginTransaction,
-//      o que corrompia o estado do periférico HSPI no ESP32.
-//      O segundo transfer() retornava lixo do buffer RX (0x0F).
-//      Agora usa UM ciclo CSN, UM transfer — igual ELECHOUSE
-//      e SmartRC-CC1101-Driver-Lib (que funcionam no ESP32).
-//   2. Adicionado waitMisoReady() antes/depois de command strobes.
-//      Espera MISO LOW (crystal pronto) como datasheet TI seção 11.2.
-//   3. CRITICAL SECTIONS com portMUX_TYPE — ESP-IDF 4.4+ requer
-//      portMUX_TYPE* como argumento.
-//   4. Re-init completo do SPI (end+begin) no wake — garante
-//      que o periférico HSPI está limpo após longo sleep.
-//   5. attachInterrupt REMOVIDO do wake — a ISR ficava armada
-//      com GDO0 flutuando, gerando interrupções espúreas durante
-//      transações SPI. ISR agora é attachada SOMENTE quando
-//      entra em RX e detachada ao sair.
-//   6. Status byte logado para TODOS os comandos strobe.
+// CORREÇÕES CRÍTICAS vs versão v4:
+//   1. GoRx v5: SRX retries anti-WiFi TX EMI.
+//      EVIDÊNCIA: WiFi OFF → SRX funciona (state=0x0D).
+//      WiFi ON → SRX corrompido por EMI no MOSI, chip vai pra SLEEP.
+//      Status 0x0F é artefato de leitura — NÃO indica falha do comando.
+//   2. delayMicroseconds() em vez de delay() em todo o fluxo
+//      GoRx/Sleep — impede yield do scheduler, WiFi não agenda TX
+//      durante sequência crítica SPI.
+//   3. Se SRX falhar (state=SLEEP), reenvia SIDLE+SRX sem reset.
+//      Até 5 retries com delays crescentes.
+//   4. cc1101SendCommand: single CSN cycle (v4, mantido).
+//   5. waitMisoReady() antes/depois de command strobes (v4, mantido).
+//   6. CRITICAL SECTIONS com portMUX_TYPE (v3, mantido).
 // ============================================================
 
 SPIClass spiCC1101(HSPI);
@@ -519,9 +514,28 @@ static void cc1101DetachISR() {
 }
 
 // ============================================================
-// GoRx — Entrar em modo RX com calibração automática
-// Importante: ISR DEVE estar desativada durante configuração.
-// Só ativa ISR após chip estar em RX.
+// GoRx v5 — Robusto contra interferência WiFi TX
+//
+// PROBLEMA IDENTIFICADO:
+//   WiFi AP transmite beacons a cada ~100ms. Durante cada burst TX,
+//   o pico de corrente (~300mA) causa EMI no MOSI (GPIO 13),
+//   corrompendo o byte SRX (0x34 → 0x39 = SPWD). O chip vai pra
+//   SLEEP em vez de RX.
+//
+// EVIDÊNCIA:
+//   - WiFi OFF: SRX funciona, state=0x0D (RX) ✓
+//   - WiFi ON:  SRX falha, state=0x00 (SLEEP) ✗
+//   - Status 0x0F é lido IGUAL nos dois casos — é artefato do ESP32,
+//     não indica falha real do comando.
+//
+// ESTRATÉGIA v5:
+//   1. delayMicroseconds() em vez de delay() — não yielda para
+//      o scheduler, evitando que WiFi agende TX no meio da sequência.
+//   2. Se SRX falhar (state=SLEEP), não faz reset! Apenas reenvia
+//      SIDLE + SRX. O chip responde a command strobes mesmo em SLEEP
+//      se o crystal estiver rodando (que está, pois registers funcionam).
+//   3. Até 3 retries com delays crescentes (2ms, 5ms, 10ms).
+//   4. Só faz reset completo se TODOS os retries falharem.
 // ============================================================
 static bool cc1101GoRx(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
@@ -539,13 +553,13 @@ static bool cc1101GoRx(uint32_t freqHz) {
 
     // IDLE → set frequency → calibrate → IDLE → RX
     cc1101SendCommand(CC1101_SIDLE);
-    delay(2);
+    delayMicroseconds(2000);  // busy-wait: não yielda, WiFi não TX
 
     cc1101SetFrequency(freqHz);
     cc1101CalibrateBand(freqMHz);
 
     cc1101SendCommand(CC1101_SIDLE);
-    delay(2);
+    delayMicroseconds(2000);  // busy-wait
 
     // Verifica que chip esta em IDLE antes de enviar SRX
     state = readMarcState();
@@ -553,34 +567,59 @@ static bool cc1101GoRx(uint32_t freqHz) {
     if (state != 0x01) {
         Serial.printf("[CC1101] GoRx: nao esta em IDLE (0x%02X), forçando SIDLE\n", state);
         cc1101SendCommand(CC1101_SIDLE);
-        delay(5);
+        delayMicroseconds(5000);
         state = readMarcState();
         Serial.printf("[CC1101] GoRx: apos SIDLE state=0x%02X\n", state);
     }
 
-    // Envia SRX
-    cc1101SendCommand(CC1101_SRX);
+    // === SRX com retries anti-WiFi ===
+    // O WiFi TX corrompe o byte SRX por EMI no MOSI.
+    // Se o chip foi pro SLEEP, reenviamos SIDLE+SRX sem reset.
+    const int maxRetries = 5;
+    unsigned int retryDelays[] = {2000, 3000, 5000, 8000, 12000};
 
-    // Espera calibracao automatica + settling (a calibracao leva ~1ms tipico)
-    // Mas damos 20ms para margem de seguranca
-    delay(20);
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        cc1101SendCommand(CC1101_SRX);
 
-    state = readMarcState();
-    Serial.printf("[CC1101] GoRx: estado final=0x%02X @ %lu Hz\n", state, freqHz);
+        // Espera calibração automática (FS_AUTOCAL=1, ~1ms tipico)
+        // Usa busy-wait para evitar WiFi TX durante a espera
+        delayMicroseconds(retryDelays[attempt]);
 
-    // Se nao entrou em RX, espera mais e verifica de novo
-    if (state != 0x0D && state != 0x0E) {
-        delay(30);
         state = readMarcState();
-        Serial.printf("[CC1101] GoRx: retry state=0x%02X\n", state);
+        if (attempt == 0) {
+            Serial.printf("[CC1101] GoRx: estado final=0x%02X @ %lu Hz\n", state, freqHz);
+        }
+
+        if (state == 0x0D || state == 0x0E) {
+            Serial.printf("[CC1101] GoRx: SUCESSO (state=0x%02X, attempt=%d)\n", state, attempt + 1);
+            return true;
+        }
+
+        // SRX foi corrompido pelo WiFi — chip em SLEEP (0x00)
+        // Reenvia SIDLE para voltar ao IDLE, depois SRX de novo
+        if (state == 0x00) {
+            Serial.printf("[CC1101] GoRx: SRX corrompido (SLEEP), retry %d/%d...\n",
+                attempt + 2, maxRetries);
+            cc1101SendCommand(CC1101_SIDLE);
+            delayMicroseconds(1000);
+            // Verifica se voltou ao IDLE
+            state = readMarcState();
+            if (state != 0x01) {
+                // Chip não voltou ao IDLE — algo mais grave
+                Serial.printf("[CC1101] GoRx: chip nao voltou ao IDLE (0x%02X), abortando retries\n", state);
+                break;
+            }
+            continue;  // tenta SRX de novo
+        }
+
+        // Estado inesperado que não é RX nem SLEEP
+        Serial.printf("[CC1101] GoRx: estado inesperado 0x%02X, retry %d/%d...\n",
+            state, attempt + 2, maxRetries);
+        cc1101SendCommand(CC1101_SIDLE);
+        delayMicroseconds(2000);
     }
 
-    if (state == 0x0D || state == 0x0E) {
-        Serial.printf("[CC1101] GoRx: SUCESSO (state=0x%02X)\n", state);
-        return true;
-    }
-
-    Serial.printf("[CC1101] GoRx: FALHOU, state=0x%02X\n", state);
+    Serial.printf("[CC1101] GoRx: FALHOU apos %d tentativas, state=0x%02X\n", maxRetries, state);
     return false;
 }
 
@@ -600,7 +639,7 @@ void cc1101Sleep() {
     cc1101DetachISR();     // Remove ISR antes de dormir
     isr_enabled = false;
     cc1101SendCommand(CC1101_SIDLE);
-    delay(1);
+    delayMicroseconds(1000);  // busy-wait: sem yield para WiFi
     cc1101SendCommand(CC1101_SPWD);
     cc1101Awake = false;
     Serial.println("[CC1101] Modulo em SLEEP");
