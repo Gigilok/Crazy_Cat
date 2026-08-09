@@ -20,12 +20,12 @@
 #define NRF_MOSI    23
 #define NRF_MISO    19
 
-#define CC1101_GDO0 16
+#define CC1101_GDO0 17
 #define CC1101_CSN  15
 #define CC1101_SCK  14
 #define CC1101_MOSI 13
 #define CC1101_MISO 12
-#define CC1101_GDO2 17
+#define CC1101_GDO2 16
 
 #define BUZZER_PIN  4
 
