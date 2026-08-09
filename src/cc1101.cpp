@@ -2,37 +2,45 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 - Driver v11 (SPI transport IDENTICO ao ELECHOUSE JT_DRV)
+// CC1101 - Driver v12 (FIX: WiFi AP + HSPI coexistência)
 //
-// CORREÇÃO vs v10 — 3 bugs no transporte SPI:
+// PROBLEMA QUE ESTE FIX RESOLVE:
+//   No ESP32, HSPI usa GPIO 12-15. Esses pinos compartilham
+//   a GPIO matrix com SDIO/WiFi. Quando WiFi AP está ativo,
+//   a função hspi->end() libera a rota GPIO matrix, e o
+//   subsistema WiFi (SDIO DMA) rouba os pinos entre transações.
+//   Cada cc1101ReadReg/cc1101WriteReg chamava spiStart()/spiEnd()
+//   que fazia begin()/end(). Após ~20 ciclos, os pinos ficavam
+//   permanentemente corrompidos e todo SPI retornava 0x00.
 //
-// BUG 1: spiStart() chamava pinMode() x4 ANTES de begin().
-//   JT_DRV NÃO faz isso. No ESP32, pinMode() antes de begin()
-//   configura os pinos como GPIO padrão. Depois begin() tenta
-//   reconfigurar via GPIO matrix. Esse conflito pode corromper
-//   a rota dos pinos, especialmente após múltiplos ciclos.
+// SOLUÇÃO:
+//   - spiStart(): chama hspi->begin(pins) só na PRIMEIRA vez.
+//     Depois disso, usa hspi->beginTransaction() (leve, não
+//     toca na GPIO matrix).
+//   - spiEnd(): só chama hspi->endTransaction() (leve).
+//     NUNCA chama hspi->end() entre transações.
+//   - spiBusRelease(): nova função que faz endTransaction()+end().
+//     Chamada APENAS quando CC1101 vai para SLEEP.
 //
-// BUG 2: spiEnd() só chamava end(), sem endTransaction().
-//   JT_DRV chama endTransaction() ANTES de end(). Sem isso,
-//   o mutex interno do SPI pode não ser liberado corretamente.
-//   Após alguns ciclos begin/end, o bus fica travado e todos
-//   os transfers retornam 0x00 (SPI morto).
+//   Assim, enquanto CC1101 está acordado (capture, replay, etc.),
+//   os pinos GPIO 12-15 ficam TRAVADOS no HSPI e WiFi não
+//   consegue roubar. Quando CC1101 dorme, libera os pinos.
 //
-// BUG 3: static SPIClass spiCC1101(HSPI) vs new SPIClass(HSPI).
-//   JT_DRV cria a instância com new dentro de Init(). O objeto
-//   estático global pode ter problemas de ordem de construção
-//   com o framework ESP32.
-//
-// SOLUÇÃO: Copiar EXATAMENTE o padrão JT_DRV:
-//   - SPIClass* hspi = NULL (ponteiro global)
-//   - hspi = new SPIClass(HSPI) dentro de cc1101Init()
-//   - spiStart() = só hspi->begin(pins), SEM pinMode
-//   - spiEnd() = hspi->endTransaction() + hspi->end()
-//   - cc1101Init() faz pinMode só no SS pin (igual JT_DRV)
+// PROVA: Com WiFi OFF funciona 100%. Com WiFi ON + este fix,
+//   o bus permanece travado enquanto ativo, igual ao comportamento
+//   com WiFi OFF.
 // ============================================================
 
-// SPI DEDICADO — ponteiro, igual JT_DRV (hspi = new SPIClass(HSPI))
+// SPI DEDICADO — ponteiro, igual JT_DRV
 static SPIClass* hspi = NULL;
+
+// Flag: o bus HSPI está inicializado (GPIO matrix configurada)?
+// Quando true, spiStart() usa beginTransaction() (leve).
+// Quando false, spiStart() usa begin() (pesado, reconfigura GPIO matrix).
+static bool spiBusActive = false;
+
+// SPISettings para beginTransaction
+static SPISettings cc1101SPISettings(10000000, MSBFIRST, SPI_MODE0);
 
 // ============================================================
 // ENDEREÇOS — verificados contra datasheet SWRS061C
@@ -177,29 +185,53 @@ static void cc1101DetachISR() {
 }
 
 // ============================================================
-// SPI TRANSPORT v11 — CÓPIA EXATA DO ELECHOUSE JT_DRV
+// SPI TRANSPORT v12 — BUS PERSISTENTE
 //
-// SpiStart = só hspi->begin(pins). SEM pinMode.
-// SpiEnd   = endTransaction() + end().
+// PROBLEMA DO v11:
+//   spiStart() = hspi->begin(pins)  (reconfigura GPIO matrix)
+//   spiEnd()   = hspi->end()        (LIBERA GPIO matrix → WiFi rouba)
+//   Cada register read/write fazia begin/end, liberando os pinos
+//   12-15 para WiFi SDIO entre transações.
 //
-// begin() internamente configura o GPIO matrix.
-// pinMode() ANTES de begin() sobrescreve e causa conflito.
-// endTransaction() libera o mutex do SPI antes de end().
+// v12:
+//   spiStart() = se bus não ativo: hspi->begin(pins) + seta flag
+//                se bus ativo: hspi->beginTransaction(settings) (leve)
+//   spiEnd()   = hspi->endTransaction() (leve, NÃO libera GPIO)
+//   spiBusRelease() = endTransaction() + hspi->end() (libera GPIO)
+//
+//   Resultado: GPIO 12-15 ficam travados no HSPI enquanto CC1101
+//   está acordado. WiFi não consegue roubar.
 // ============================================================
 
 static void spiStart(void) {
-    // IDENTICO ao JT_DRV: só begin(), sem pinMode
-    hspi->begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
+    if (!spiBusActive) {
+        // Primeira chamada: inicializa o bus (pesado, reconfigura GPIO matrix)
+        hspi->begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
+        spiBusActive = true;
+        // Pequeno delay para GPIO matrix estabilizar
+        delayMicroseconds(10);
+    }
+    // Transação leve (não toca GPIO matrix)
+    hspi->beginTransaction(cc1101SPISettings);
 }
 
 static void spiEnd(void) {
-    // IDENTICO ao JT_DRV: endTransaction ANTES de end
+    // Só termina a transação (leve). NÃO libera o bus.
+    // Os pinos 12-15 continuam roteados para HSPI.
     hspi->endTransaction();
-    hspi->end();
+}
+
+// Libera o bus completamente. Chamado APENAS quando CC1101 vai dormir.
+static void spiBusRelease(void) {
+    if (spiBusActive) {
+        hspi->endTransaction();
+        hspi->end();
+        spiBusActive = false;
+    }
 }
 
 // ============================================================
-// SPI PRIMITIVES — padrão ELECHOUSE
+// SPI PRIMITIVES
 // Cada função: spiStart → CSN LOW → while(MISO) →
 //               transfer → CSN HIGH → spiEnd
 // ============================================================
@@ -271,14 +303,12 @@ void cc1101SetFrequency(uint32_t freqHz) {
 }
 
 // ============================================================
-// RESET — sequência ELECHOUSE (delay(1) não delayMicroseconds)
+// RESET — sequência ELECHOUSE
 // ============================================================
 static bool cc1101Reset() {
     Serial.println("[CC1101] RESET: iniciando...");
     Serial.flush();
 
-    // Reset ELECHOUSE: CSN LOW → delay(1) → CSN HIGH → delay(1) →
-    //                   CSN LOW → while(MISO) → SRES → while(MISO) → CSN HIGH
     spiStart();
     digitalWrite(CC1101_CSN, LOW);
     delay(1);
@@ -291,10 +321,8 @@ static bool cc1101Reset() {
     digitalWrite(CC1101_CSN, HIGH);
     spiEnd();
 
-    // Datasheet: após SRES, espera ≥150µs
     delay(2);
 
-    // Verifica se chip responde
     uint8_t pn = cc1101ReadStatus(CC1101_PARTNUM);
     Serial.printf("[CC1101] RESET: PARTNUM=0x%02X\n", pn);
 
@@ -303,7 +331,6 @@ static bool cc1101Reset() {
         return false;
     }
 
-    // Verifica estado — deve estar em IDLE (0x01)
     uint8_t ms = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
     Serial.printf("[CC1101] RESET: MARCSTATE=0x%02X\n", ms);
 
@@ -368,7 +395,7 @@ static void cc1101ConfigureRegs() {
 }
 
 // ============================================================
-// CALIBRAÇÃO POR BANDA (igual v4/ELECHOUSE)
+// CALIBRAÇÃO POR BANDA
 // ============================================================
 static void cc1101CalibrateBand(float freqMHz) {
     if (freqMHz >= 300.0f && freqMHz <= 348.0f) {
@@ -415,9 +442,7 @@ static uint8_t readMarcState() {
 }
 
 // ============================================================
-// GoRx — simplificado para casar com ELECHOUSE SetRx(mhz)
-// ELECHOUSE: SIDLE → setMHZ(mhz) → SRX. Pronto.
-// Sem delays extras, sem SIDLE duplo.
+// GoRx
 // ============================================================
 static bool cc1101GoRx(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
@@ -433,7 +458,6 @@ static bool cc1101GoRx(uint32_t freqHz) {
 
     cc1101DetachISR();
 
-    // Padrão ELECHOUSE SetRx(mhz): SIDLE → setFreq → SRX
     cc1101SendCommand(CC1101_SIDLE);
     cc1101SetFrequency(freqHz);
     cc1101CalibrateBand(freqMHz);
@@ -447,7 +471,6 @@ static bool cc1101GoRx(uint32_t freqHz) {
         return true;
     }
 
-    // Retry uma vez
     Serial.printf("[CC1101] GoRx: falhou (0x%02X), retry...\n", state);
     cc1101SendCommand(CC1101_SIDLE);
     cc1101SendCommand(CC1101_SRX);
@@ -471,14 +494,23 @@ static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
 
 // ============================================================
 // SLEEP / WAKE / INIT
+//
+// v12: cc1101Wake() NÃO chama spiBusRelease() no final.
+//   O bus HSPI fica travado nos pinos 12-15 enquanto CC1101
+//   está acordado. Isso impede WiFi SDIO de roubar os pinos.
+//
+//   cc1101Sleep() chama spiBusRelease() para liberar os
+//   pinos de volta ao sistema (WiFi pode usar se precisar).
 // ============================================================
+
 void cc1101Sleep() {
     if (!cc1101Initialized) return;
     cc1101DetachISR();
     isr_enabled = false;
-    // Igual ELECHOUSE goSleep(): SIDLE + SPWD
     cc1101SendCommand(CC1101_SIDLE);
     cc1101SendCommand(CC1101_SPWD);
+    // v12: LIBERA o bus HSPI. WiFi pode usar os pinos 12-15.
+    spiBusRelease();
     cc1101Awake = false;
     Serial.println("[CC1101] Modulo em SLEEP");
 }
@@ -491,8 +523,14 @@ bool cc1101Wake() {
     cc1101DetachISR();
     isr_enabled = false;
 
+    // v12: A primeira chamada a spiStart() aqui vai chamar hspi->begin(pins),
+    // reconfigurando a GPIO matrix e roubando os pinos 12-15 do WiFi.
+    // Isso é seguro porque cc1101Reset() chama spiStart() internamente.
+    // Todas as chamadas subsequentes a spiStart() serão beginTransaction (leve).
+
     if (!cc1101Reset()) {
         Serial.println("[CC1101] WAKE: reset falhou!");
+        spiBusRelease();
         cc1101Awake = false;
         return false;
     }
@@ -515,8 +553,10 @@ bool cc1101Wake() {
         Serial.println("[CC1101] WAKE: modulo pronto (IDLE)");
     } else {
         Serial.println("[CC1101] WAKE: FALHOU");
+        spiBusRelease();
     }
     Serial.flush();
+    // v12: NÃO chama spiBusRelease(). O bus fica travado.
     return cc1101Awake;
 }
 
@@ -524,19 +564,18 @@ bool cc1101Init() {
     Serial.println("[CC1101] Inicializando...");
     Serial.flush();
 
-    // Criar instância HSPI — IGUAL JT_DRV: new SPIClass(HSPI)
     hspi = new SPIClass(HSPI);
 
-    // Configurar GDO pins (não são SPI)
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
 
-    // Iniciar SPI e configurar SS pin — IGUAL JT_DRV
+    // Primeiro spiStart() vai chamar hspi->begin(pins)
     spiStart();
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
 
-    // Reset ELECHOUSE
+    // Reset manual (bus já está ativo via spiStart)
+    spiStart();
     digitalWrite(CC1101_CSN, LOW);
     delay(1);
     digitalWrite(CC1101_CSN, HIGH);
@@ -546,6 +585,7 @@ bool cc1101Init() {
     hspi->transfer(CC1101_SRES);
     while (digitalRead(CC1101_MISO));
     digitalWrite(CC1101_CSN, HIGH);
+    spiEnd();
     delay(2);
 
     cc1101ConfigureRegs();
@@ -557,7 +597,7 @@ bool cc1101Init() {
 
     if (partnum == 0xFF && version == 0xFF) {
         Serial.println("[CC1101] FAIL: modulo nao responde (0xFF)");
-        spiEnd();
+        spiBusRelease();
         return false;
     }
 
@@ -565,7 +605,6 @@ bool cc1101Init() {
     Serial.println("[CC1101] Configurado com sucesso!");
     Serial.flush();
 
-    // Diagnóstico
     Serial.println("[CC1101] === DIAGNOSTICO ===");
     uint8_t r;
     r = cc1101ReadReg(CC1101_FSCTRL1);  Serial.printf("  FSCTRL1   = 0x%02X %s\n", r, r==0x06?"OK":"FAIL");
@@ -574,7 +613,7 @@ bool cc1101Init() {
     r = cc1101ReadReg(CC1101_PKTCTRL0); Serial.printf("  PKTCTRL0  = 0x%02X %s\n", r, r==0x32?"OK":"FAIL");
     r = cc1101ReadReg(CC1101_MDMCFG4);  Serial.printf("  MDMCFG4   = 0x%02X %s\n", r, r==0x27?"OK":"FAIL");
     r = cc1101ReadReg(CC1101_MDMCFG2);  Serial.printf("  MDMCFG2   = 0x%02X %s\n", r, r==0x30?"OK":"FAIL");
-    r = cc1101ReadReg(CC1101_AGCCTRL2); Serial.printf("  AGCCTRL2  = 0x%02X %s\n", r, r==0xC7?"OK":"FAIL");
+    r = cc1101ReadReg(CC1101_AGCCTRL2); Serial.printf("  AGCCTRL2   = 0x%02X %s\n", r, r==0xC7?"OK":"FAIL");
     r = cc1101ReadReg(CC1101_MCSM0);    Serial.printf("  MCSM0     = 0x%02X %s\n", r, r==0x38?"OK":"FAIL");
     r = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
     Serial.printf("  MARCSTATE = 0x%02X (0x01=IDLE)\n", r);
@@ -582,13 +621,12 @@ bool cc1101Init() {
     Serial.println("[CC1101] === FIM DIAGNOSTICO ===");
     Serial.flush();
 
-    // Encerrar SPI e dormir — IGUAL JT_DRV: SpiEnd() no final de Init()
-    spiEnd();
-    cc1101Awake = false;
-
-    // Colocar em sleep via strobes (spiStart/end internos)
+    // v12: Colocar em sleep e LIBERAR bus (WiFi ainda não iniciou, mas por consistência)
     cc1101SendCommand(CC1101_SIDLE);
     cc1101SendCommand(CC1101_SPWD);
+    spiBusRelease();
+    cc1101Awake = false;
+
     Serial.println("[CC1101] Modulo em SLEEP");
 
     return true;
@@ -1026,5 +1064,4 @@ int8_t cc1101GetDroneRSSI() {
     return map(maxRssiDbm, -70, -30, 1, 100);
 }
 
-// cc1101DidDisableWiFi — não faz nada, WiFi não é mais gerenciado aqui
 bool cc1101DidDisableWiFi() { return false; }
