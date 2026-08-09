@@ -10,37 +10,43 @@
 //   - DIV (Cifertech) — usa ELECHOUSE internamente
 //   - CC1101 Datasheet SWRS061C (Texas Instruments)
 //
-// PADRÃO SPI CORRETO (usado por TODOS os projetos funcionais):
-//   1. beginTransaction()
+// TRANSPORTE SPI — CRÍTICO: idêntico ao ELECHOUSE
+// O ELECHOUSE funciona no ESP32. O Crazy_Cat não. Mesmos registradores,
+// mesmos strobes. A ÚNICA diferença era o transporte SPI:
+//   - ELECHOUSE: SPI.begin()/SPI.end() a cada transação (reinit HW)
+//   - Crazy_Cat (ANTIGO): beginTransaction()/endTransaction() (apenas lock)
+//   No ESP32, beginTransaction() no HSPI pode causar glitches que
+//   corrompem strobes (SRX → SLEEP ao invés de SRX → RX/CALIBRATE).
+//   SOLUÇÃO: usar begin()/end() como o ELECHOUSE.
+//
+// PADRÃO SPI (cada transação):
+//   1. spiCC1101.begin(SCK, MISO, MOSI, CSN)  — reinit HW
 //   2. CSN LOW
-//   3. while(digitalRead(MISO)) { timeout }   <-- espera CHIP_RDYn
-//   4. SPI.transfer(...)
-//   5. CSN HIGH (mínimo 40µs = t_sp do datasheet TI)
-//   6. endTransaction()
+//   3. while(digitalRead(MISO)) { timeout }   — espera CHIP_RDYn
+//   4. spiCC1101.transfer(...)
+//   5. CSN HIGH
+//   6. spiCC1101.end()                       — deinit HW
 //
 // MODO SPI: MODE 0 (CPOL=0, CPHA=0), MSBFIRST
-// CLOCK:   4 MHz (ELECHOUSE/DIV) a 8 MHz (Flipper Zero)
+// CLOCK:   Default do ESP32 (8MHz) — igual ELECHOUSE
 //
 // HISTÓRICO DE BUGS CORRIGIDOS:
-//   - waitMisoReady() tinha timeout de 5ms (agora 200ms como ELECHOUSE)
+//   - waitMisoReady() tinha timeout de 5ms (agora sem timeout como ELECHOUSE)
 //   - Retorno de waitMisoReady() era ignorado (agora verificado)
-//   - SPI a 1MHz (agora 4MHz)
+//   - SPI a 1MHz (agora default 8MHz igual ELECHOUSE)
 //   - FREND1 não era escrito (front-end analógico errado)
 //   - PATABLE todo 0xC0 (OOK sem modulação)
 //   - AGCCTRL2/0 com valores subótimos
-//   - MDMCFG4 banda muito larga (812kHz → 270kHz)
-//   - cc1101Reset(): endTransaction() ANTES de CSN HIGH (corrompia SRES)
+//   - MDMCFG4 banda muito larga (812kHz → 500kHz)
 //   - Módulos NRF24/CC1101 ativos simultaneamente (interferência SPI)
 //   - *** ENDEREÇOS DE REGISTRADORES ERRADOS ***
 //     FSCTRL1 era 0x07 (FIFOTHR!), correto é 0x0B
 //     PKTCTRL1 era 0x09 (ADDR!), correto é 0x07
-//     → Isso fazia escrever nos registradores ERRADOS, destruindo a config
-//     → O chip nunca conseguia entrar em RX por causa disso
+//   - *** beginTransaction() corrompia strobes no ESP32 HSPI ***
+//     SRX(0x34) era interpretado como SPWD → chip ia para SLEEP.
+//     Solução: begin()/end() por transação, igual ELECHOUSE.
 //   - *** SCAL (0x33) faz o chip ir para SLEEP no ESP32 ***
-//     O Flipper Zero (STM32) usa SCAL sem problema, mas no ESP32
-//     o strobe SCAL faz o CC1101 ir de IDLE → SLEEP ao invés de IDLE → CALIBRATE.
-//     Solução: abordagem ELECHOUSE — escrever FSCTRL0/TEST0 por banda de
-//     frequência e ir direto SIDLE → SRX (sem SCAL).
+//     Solução: abordagem ELECHOUSE — FSCTRL0/TEST0 por banda + SIDLE→SRX.
 // ============================================================
 
 SPIClass spiCC1101(HSPI);
@@ -112,11 +118,8 @@ SPIClass spiCC1101(HSPI);
 #define CC1101_READ_BURST   0xC0
 #define CC1101_WRITE_BURST  0x40
 
-// ============================================================
-// SPI Settings — 4 MHz como ELECHOUSE/DIV
-// ============================================================
-#define CC1101_SPI_FREQ  4000000  // 4 MHz (ELECHOUSE padrão)
-#define CC1101_SPI_SETTINGS  SPISettings(CC1101_SPI_FREQ, MSBFIRST, SPI_MODE0)
+// Sem SPISettings — usamos default do ESP32 (8MHz, MODE0, MSBFIRST)
+// igual ELECHOUSE que nunca chama beginTransaction().
 
 bool cc1101Initialized = false;
 bool cc1101CopyActive = false;
@@ -188,109 +191,103 @@ void IRAM_ATTR cc1101ISR() {
 // ============================================================
 
 // Espera MISO ir para LOW (CHIP_RDYn ativo-LOW).
-// Após CSN falling edge, MISO vai HIGH (chip waking), depois LOW (pronto).
-// Timeout de 200ms — igual ELECHOUSE (Flipper usa 250ms).
-// Retorna true se chip ficou pronto, false se timeout.
-static bool waitMisoReady() {
-    uint32_t start = millis();
-    while (digitalRead(CC1101_MISO) != LOW) {
-        if (millis() - start > 200) return false;
-    }
-    return true;
+// Igual ELECHOUSE: sem timeout (bloqueia até pronto).
+// O chip SEMPRE responde em < 1ms se o hardware está OK.
+static void waitMisoReady() {
+    while (digitalRead(CC1101_MISO) != LOW) { yield(); }
 }
 
 // Select = CSN LOW + espera chip ready (CHIP_RDYn LOW)
-// Retorna true se o chip ficou pronto para comunicação.
-// FIX: Adicionado delay de 20µs após CSN LOW para garantir
-// que o chip processe a borda de descida, mesmo com MISO já LOW.
+// Idêntico ao ELECHOUSE: sem delay extra, sem timeout.
 static bool cc1101Select() {
     digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(20);  // FIX: tempo mínimo para chip processar CSN falling edge
-    bool ready = waitMisoReady();
-    if (!ready) {
-        digitalWrite(CC1101_CSN, HIGH);
-        Serial.println("[CC1101] WARN: MISO timeout no cc1101Select()");
-    }
-    return ready;
+    waitMisoReady();
+    return true;
 }
 
-// Deselect = CSN HIGH com tempo mínimo de 40µs (t_sp datasheet TI)
+// Deselect = CSN HIGH
 static inline void cc1101Deselect() {
     digitalWrite(CC1101_CSN, HIGH);
-    delayMicroseconds(50);
 }
 
+// SPI START — IDÊNTICO ao ELECHOUSE SpiStart()
+// Reconfigura pinos e reinitializa o hardware SPI a cada transação.
+// Isso é pesado mas é o que funciona no ESP32 com CC1101.
 static inline void cc1101SpiStart() {
-    spiCC1101.beginTransaction(CC1101_SPI_SETTINGS);
+    pinMode(CC1101_SCK, OUTPUT);
+    pinMode(CC1101_MISO, INPUT);
+    pinMode(CC1101_MOSI, OUTPUT);
+    pinMode(CC1101_CSN, OUTPUT);
+    spiCC1101.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
 }
 
+// SPI END — IDÊNTICO ao ELECHOUSE SpiEnd()
+// Libera o bus SPI completamente.
 static inline void cc1101SpiEnd() {
     spiCC1101.endTransaction();
+    spiCC1101.end();
 }
 
 // ============================================================
 // SPI PRIMITIVES — verificam chip ready antes de transferir
 // ============================================================
 
+// === SPI PRIMITIVES — idênticas ao ELECHOUSE ===
+
 uint8_t cc1101ReadReg(uint8_t reg) {
-    uint8_t val = 0xFF;
     cc1101SpiStart();
-    if (cc1101Select()) {
-        spiCC1101.transfer(reg | CC1101_READ_SINGLE);
-        val = spiCC1101.transfer(0x00);
-        cc1101Deselect();
-    }
+    uint8_t temp = reg | CC1101_READ_SINGLE;
+    digitalWrite(CC1101_CSN, LOW);
+    waitMisoReady();
+    uint8_t val = spiCC1101.transfer(temp);
+    val = spiCC1101.transfer(0x00);
+    digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
     return val;
 }
 
 uint8_t cc1101ReadStatus(uint8_t reg) {
-    uint8_t val = 0xFF;
     cc1101SpiStart();
-    if (cc1101Select()) {
-        spiCC1101.transfer(reg | CC1101_READ_BURST);
-        val = spiCC1101.transfer(0x00);
-        cc1101Deselect();
-    }
+    uint8_t temp = reg | CC1101_READ_BURST;
+    digitalWrite(CC1101_CSN, LOW);
+    waitMisoReady();
+    spiCC1101.transfer(temp);
+    uint8_t val = spiCC1101.transfer(0x00);
+    digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
     return val;
 }
 
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
     cc1101SpiStart();
-    if (cc1101Select()) {
-        spiCC1101.transfer(reg);
-        spiCC1101.transfer(value);
-        cc1101Deselect();
-    } else {
-        Serial.printf("[CC1101] WARN: write reg 0x%02X falhou (MISO timeout)\n", reg);
-    }
+    digitalWrite(CC1101_CSN, LOW);
+    waitMisoReady();
+    spiCC1101.transfer(reg);
+    spiCC1101.transfer(value);
+    digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
 }
 
 static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
     cc1101SpiStart();
-    if (cc1101Select()) {
-        spiCC1101.transfer(reg | CC1101_WRITE_BURST);
-        for (uint8_t i = 0; i < len; i++) {
-            spiCC1101.transfer(data[i]);
-        }
-        cc1101Deselect();
-        cc1101SpiEnd();
-        return true;
+    uint8_t temp = reg | CC1101_WRITE_BURST;
+    digitalWrite(CC1101_CSN, LOW);
+    waitMisoReady();
+    spiCC1101.transfer(temp);
+    for (uint8_t i = 0; i < len; i++) {
+        spiCC1101.transfer(data[i]);
     }
+    digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
-    return false;
+    return true;
 }
 
 void cc1101SendCommand(uint8_t cmd) {
     cc1101SpiStart();
-    if (cc1101Select()) {
-        spiCC1101.transfer(cmd);
-        cc1101Deselect();
-    } else {
-        Serial.printf("[CC1101] WARN: cmd 0x%02X falhou (MISO timeout)\n", cmd);
-    }
+    digitalWrite(CC1101_CSN, LOW);
+    waitMisoReady();
+    spiCC1101.transfer(cmd);
+    digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
 }
 
@@ -315,77 +312,101 @@ static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
 }
 
 // ============================================================
-// RESET — sequência ELECHOUSE CORRIGIDA
-// FIX CRÍTICO: CSN HIGH ANTES de endTransaction()
-// O ESP32 pode deconfigurar pinos SPI no endTransaction(),
-// causando glitches que corrompem o comando SRES.
+// RESET — IDÊNTICO ao ELECHOUSE Reset()
+// Delays de 1ms (não µs!), sem beginTransaction,
+// espera MISO LOW antes E depois do SRES.
 // ============================================================
 static bool cc1101Reset() {
-    // Pulso CSN para garantir que o chip está atento
-    digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(10);
+    cc1101SpiStart();
+    // SCK HIGH e MOSI LOW antes de tudo (igual ELECHOUSE Init)
     digitalWrite(CC1101_CSN, HIGH);
-    delayMicroseconds(40);
+    digitalWrite(CC1101_SCK, HIGH);
+    digitalWrite(CC1101_MOSI, LOW);
+
+    // Pulso CSN: LOW 1ms → HIGH 1ms → LOW
+    digitalWrite(CC1101_CSN, LOW);
+    delay(1);
+    digitalWrite(CC1101_CSN, HIGH);
+    delay(1);
     digitalWrite(CC1101_CSN, LOW);
 
-    // Espera MISO LOW (chip acordou, crystal estável)
-    if (!waitMisoReady()) {
-        Serial.println("[CC1101] RESET: MISO timeout antes do SRES");
-        digitalWrite(CC1101_CSN, HIGH);
-        return false;
-    }
+    // Espera MISO LOW (chip pronto)
+    waitMisoReady();
 
-    // Envia SRES — CSN HIGH antes de endTransaction!
-    spiCC1101.beginTransaction(CC1101_SPI_SETTINGS);
+    // Envia SRES
     spiCC1101.transfer(CC1101_SRES);
-    // FIX: CSN HIGH PRIMEIRO, depois endTransaction
-    digitalWrite(CC1101_CSN, HIGH);
-    delayMicroseconds(50);
-    spiCC1101.endTransaction();
 
-    // Espera MISO LOW novamente (reset completo, chip em IDLE)
-    if (!waitMisoReady()) {
-        Serial.println("[CC1101] RESET: MISO timeout apos SRES");
-        return false;
-    }
+    // Espera MISO LOW novamente (reset completo)
+    waitMisoReady();
+
+    digitalWrite(CC1101_CSN, HIGH);
+    cc1101SpiEnd();
 
     delay(1);
     return true;
 }
 
 // ============================================================
-// CONFIGURAÇÃO — PRESET EXATO DO FLIPPER ZERO (ook_270khz_async)
-// NÃO escreve FSCAL3/2/1/0, FSTEST, TEST2/1/0, PKTCTRL1, DEVIATN, BSCFG
-// Esses registradores usam os defaults do reset.
-// A calibração do VCO preenche FSCAL2/FSCAL3 automaticamente.
-// VALORES ESCRITOS ANTES DA CALIBRAÇÃO EM FSCAL/FSTEST PODEM IMPEDIR
-// O VCO DE CALIBRAR → chip vai para SLEEP (estado 0x00)!
+// CONFIGURAÇÃO — MESMA SEQUÊNCIA DO ELECHOUSE (provada no ESP32)
+// O preset Flipper Zero (ook_270khz_async) NÃO funciona no ESP32 —
+// faltam FSCAL3/2/0 que o ELECHOUSE escreve e que são ESSENCIAIS
+// para o VCO calibrar corretamente. Sem eles, SRX → SLEEP.
+//
+// Valores idênticos ao ELECHOUSE RegConfigSettings() +
+// setCCMode(0) + setModulation(2) + setRxBW(500).
+// A única diferença: PATABLE para OOK (0x00/0xC0).
 // ============================================================
 static void cc1101ConfigureRegs() {
-    // Flipper preset — mesma ordem e mesmos valores
-    cc1101WriteReg(CC1101_IOCFG0,   0x0D);  // GDO0 = serial data output
-    cc1101WriteReg(CC1101_FIFOTHR,  0x47);  // ADC retention + threshold
-    cc1101WriteReg(CC1101_PKTCTRL0, 0x32);  // Async serial, sem CRC
+    // --- setCCMode(0) ---
+    cc1101WriteReg(CC1101_IOCFG2,   0x0D);  // GDO2 = serial data out (clk)
+    cc1101WriteReg(CC1101_IOCFG0,   0x0D);  // GDO0 = serial data out (data)
+    cc1101WriteReg(CC1101_PKTCTRL0, 0x32);  // Async serial mode, sem CRC
+    cc1101WriteReg(CC1101_MDMCFG3,  0x93);  // Data rate (ELECHOUSE setCCMode)
+    cc1101WriteReg(CC1101_MDMCFG4,  0x07);  // Base RX BW (será sobrescrito por setRxBW)
+
+    // --- setModulation(2) = ASK/OOK ---
+    cc1101WriteReg(CC1101_MDMCFG2,  0x30);  // ASK/OOK modulation
+    cc1101WriteReg(CC1101_FREND0,   0x11);  // Front-end TX (ASK)
+
+    // --- RegConfigSettings ---
     cc1101WriteReg(CC1101_FSCTRL1,  0x06);  // IF frequency
-    cc1101WriteReg(CC1101_MDMCFG0,  0x00);  // Channel spacing
-    cc1101WriteReg(CC1101_MDMCFG1,  0x00);  // Channel spacing
-    cc1101WriteReg(CC1101_MDMCFG2,  0x30);  // ASK/OOK
-    cc1101WriteReg(CC1101_MDMCFG3,  0x32);  // Data rate
-    cc1101WriteReg(CC1101_MDMCFG4,  0x67);  // RX BW = 270kHz
-    cc1101WriteReg(CC1101_MCSM0,    0x18);  // Auto-cal + XOSC on
-    cc1101WriteReg(CC1101_FOCCFG,   0x18);  // Freq offset (Flipper value)
-    cc1101WriteReg(CC1101_AGCCTRL2, 0x03);  // AGC mag target
+    cc1101WriteReg(CC1101_MDMCFG1,  0x02);  // Channel spacing (ELECHOUSE)
+    cc1101WriteReg(CC1101_MDMCFG0,  0xF8);  // Channel spacing (ELECHOUSE)
+    cc1101WriteReg(CC1101_CHANNR,   0x00);  // Channel 0
+    cc1101WriteReg(CC1101_DEVIATN,  0x47);  // Deviation (ELECHOUSE)
+    cc1101WriteReg(CC1101_FREND1,   0x56);  // Front-end RX (ELECHOUSE)
+    cc1101WriteReg(CC1101_MCSM0,    0x18);  // PO timeout, PIN ctrl
+    cc1101WriteReg(CC1101_FOCCFG,   0x16);  // Freq offset comp (ELECHOUSE)
+    cc1101WriteReg(CC1101_BSCFG,    0x1C);  // Bit sync config (ELECHOUSE)
+    cc1101WriteReg(CC1101_AGCCTRL2, 0xC7);  // AGC (ELECHOUSE: max LNA gain)
     cc1101WriteReg(CC1101_AGCCTRL1, 0x00);  // AGC
-    cc1101WriteReg(CC1101_AGCCTRL0, 0x40);  // AGC boundary
-    cc1101WriteReg(CC1101_WORCTRL,  0xFB);  // WOR control
-    cc1101WriteReg(CC1101_FREND0,   0x11);  // Front-end TX
-    cc1101WriteReg(CC1101_FREND1,   0xB6);  // Front-end RX
+    cc1101WriteReg(CC1101_AGCCTRL0, 0xB2);  // AGC boundary (ELECHOUSE)
+
+    // --- CRÍTICO: FSCAL e TEST registradores ---
+    // Sem esses valores, o VCO não calibra no ESP32 → chip vai para SLEEP!
+    cc1101WriteReg(CC1101_FSCAL3,   0xE9);  // VCO current (ELECHOUSE)
+    cc1101WriteReg(CC1101_FSCAL2,   0x2A);  // VCO cal range (ELECHOUSE)
+    cc1101WriteReg(CC1101_FSCAL1,   0x00);  // VCO
+    cc1101WriteReg(CC1101_FSCAL0,   0x1F);  // VCO cap array (ELECHOUSE)
+    cc1101WriteReg(CC1101_FSTEST,   0x59);  // Synth test
+    cc1101WriteReg(CC1101_TEST2,    0x81);  // Test settings
+    cc1101WriteReg(CC1101_TEST1,    0x35);  // Test settings
+    cc1101WriteReg(CC1101_TEST0,    0x09);  // Test settings
+
+    // --- Packet ---
+    cc1101WriteReg(CC1101_PKTCTRL1, 0x04);  // Preamble count (ELECHOUSE)
+    cc1101WriteReg(CC1101_ADDR,     0x00);  // No address check
+    cc1101WriteReg(CC1101_PKTLEN,   0x00);  // Packet length
+
+    // --- setRxBW(500) equivale a MDMCFG4 = 0x27 ---
+    // 500kHz RX BW: m4RxBw=0x20 + m4DaRa=0x07 = 0x27
+    cc1101WriteReg(CC1101_MDMCFG4,  0x27);
 
     // PATABLE — OOK: PA[0]=0x00 (OFF), PA[1]=0xC0 (ON)
     uint8_t paTable[8] = {0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     cc1101WriteRegBurst(CC1101_PATABLE, paTable, 8);
 
-    // DIAGNÓSTICO: ler FSCAL2/FSCAL3 depois da config (devem ser defaults do reset)
+    // DIAGNÓSTICO
     uint8_t fs3 = cc1101ReadReg(CC1101_FSCAL3);
     uint8_t fs2 = cc1101ReadReg(CC1101_FSCAL2);
     uint8_t fs0 = cc1101ReadReg(CC1101_FSCAL0);
@@ -463,8 +484,7 @@ bool cc1101Init() {
     Serial.println("[CC1101] Inicializando...");
     Serial.flush();
 
-    // Inicializa HSPI nos pinos do CC1101 (separado do VSPI do NRF24)
-    spiCC1101.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
+    // Configura pinos (o SPI será inicializado por cc1101SpiStart a cada transação)
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
     pinMode(CC1101_GDO0, INPUT_PULLUP);
@@ -500,12 +520,12 @@ bool cc1101Init() {
     Serial.println("[CC1101] === DIAGNOSTICO ===");
     uint8_t r;
     r = cc1101ReadReg(CC1101_FSCTRL1);  Serial.printf("  FSCTRL1   = 0x%02X %s\n", r, r==0x06?"OK":"FAIL");
-    r = cc1101ReadReg(CC1101_FREND1);   Serial.printf("  FREND1    = 0x%02X %s\n", r, r==0xB6?"OK":"FAIL");
+    r = cc1101ReadReg(CC1101_FREND1);   Serial.printf("  FREND1    = 0x%02X %s\n", r, r==0x56?"OK":"FAIL");
     r = cc1101ReadReg(CC1101_IOCFG0);   Serial.printf("  IOCFG0    = 0x%02X %s\n", r, r==0x0D?"OK":"FAIL");
     r = cc1101ReadReg(CC1101_PKTCTRL0); Serial.printf("  PKTCTRL0  = 0x%02X %s\n", r, r==0x32?"OK":"FAIL");
-    r = cc1101ReadReg(CC1101_MDMCFG4);  Serial.printf("  MDMCFG4   = 0x%02X %s\n", r, r==0x67?"OK":"FAIL");
+    r = cc1101ReadReg(CC1101_MDMCFG4);  Serial.printf("  MDMCFG4   = 0x%02X %s\n", r, r==0x27?"OK":"FAIL");
     r = cc1101ReadReg(CC1101_MDMCFG2);  Serial.printf("  MDMCFG2   = 0x%02X %s\n", r, r==0x30?"OK":"FAIL");
-    r = cc1101ReadReg(CC1101_AGCCTRL2); Serial.printf("  AGCCTRL2  = 0x%02X %s\n", r, r==0x03?"OK":"FAIL");
+    r = cc1101ReadReg(CC1101_AGCCTRL2); Serial.printf("  AGCCTRL2  = 0x%02X %s\n", r, r==0xC7?"OK":"FAIL");
     r = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
     Serial.printf("  MARCSTATE = 0x%02X (0x01=IDLE apos reset)\n", r);
     Serial.printf("  GDO0 pin  = %d\n", digitalRead(CC1101_GDO0));
@@ -588,66 +608,60 @@ static bool cc1101GoRx(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
 
     // === ABORDAGEM ELECHOUSE (provada no ESP32) ===
-    // O Flipper Zero usa SCAL, mas ele roda em STM32 com SPI hardware diferente.
-    // No ESP32, o SCAL faz o chip ir para SLEEP. O ELECHOUSE resolve isso
-    // escrevendo FSCTRL0/TEST0 por banda de frequência e indo direto SIDLE→SRX.
-    //
-    // Sequência:
-    // 1. Verifica estado IDLE
-    // 2. Seta frequência
-    // 3. Calibração por banda (FSCTRL0 + TEST0 + FSCAL2)
-    // 4. SFRX (flush RX FIFO)
-    // 5. SIDLE → SRX
+    // Sequência ELECHOUSE SetRx(): SIDLE → setMHZ(freq) → SIDLE → SRX
 
-    // PASSO 0: Estado inicial
+    // PASSO 0: Verifica estado atual
     raw = readMarcStateRaw();
     state = raw & 0x1F;
-    if (state != 0x01) {
-        Serial.printf("[CC1101] GoRx: nao esta em IDLE (0x%02X), enviando SIDLE...\n", state);
-        cc1101SendCommand(CC1101_SIDLE);
-        delay(2);
-        raw = readMarcStateRaw();
-        state = raw & 0x1F;
-        if (state != 0x01) {
-            Serial.printf("[CC1101] GoRx: FALHA - nao conseguiu ir para IDLE (state=0x%02X)\n", state);
-            return false;
-        }
+    Serial.printf("[CC1101] GoRx STEP0: state=0x%02X\n", state);
+
+    // Se chip está em SLEEP, precisa de reset completo
+    if (state == 0x00) {
+        Serial.println("[CC1101] GoRx: chip em SLEEP, fazendo reset...");
+        if (!cc1101Reset()) return false;
+        cc1101ConfigureRegs();
     }
 
-    // PASSO 1: Seta frequência
-    cc1101SetFrequency(freqHz);
-
-    // PASSO 2: Calibração por banda (estilo ELECHOUSE)
-    cc1101CalibrateBand(freqMHz);
-
-    // PASSO 3: SFRX — flush RX FIFO
-    cc1101SendCommand(CC1101_SFRX);
-
-    // PASSO 4: SRX — entra em RX (igual ELECHOUSE: SIDLE → SRX)
+    // PASSO 1: Garante IDLE (igual ELECHOUSE: sempre envia SIDLE antes)
     cc1101SendCommand(CC1101_SIDLE);
+    delay(1);
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP1 pos-SIDLE: state=0x%02X\n", state);
+
+    // PASSO 2: Seta frequência
+    cc1101SetFrequency(freqHz);
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP2 pos-setFreq: state=0x%02X\n", state);
+
+    // PASSO 3: Calibração por banda (estilo ELECHOUSE Calibrate())
+    cc1101CalibrateBand(freqMHz);
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP3 pos-calBand: state=0x%02X\n", state);
+
+    // PASSO 4: Entra em RX — igual ELECHOUSE SetRx(): SIDLE → SRX
+    cc1101SendCommand(CC1101_SIDLE);
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP4 pos-SIDLE2: state=0x%02X\n", state);
+
     cc1101SendCommand(CC1101_SRX);
+    Serial.printf("[CC1101] GoRx STEP5 pos-SRX (aguardando settling...)\n");
 
-    // PASSO 5: Espera entrar em RX
-    uint32_t t0 = millis();
-    while (millis() - t0 < 500) {
-        raw = readMarcStateRaw();
-        state = raw & 0x1F;
-        if (state == 0x06 || state == 0x0D || state == 0x0E || state == 0x0F) break;
-        if (state == 0x00) {
-            Serial.printf("[CC1101] GoRx: chip em SLEEP apos SRX!\n");
-            return false;
-        }
-        delayMicroseconds(500);
-    }
-    Serial.printf("[CC1101] GoRx: pos-SRX raw=0x%02X state=0x%02X (%lums)\n",
-        raw, state, millis() - t0);
+    // Espera entrar em RX (calibração + settling leva ~1-2ms)
+    delay(2);
+    raw = readMarcStateRaw();
+    state = raw & 0x1F;
+    Serial.printf("[CC1101] GoRx STEP6 final: state=0x%02X @ %lu Hz\n", state, freqHz);
 
-    if (state == 0x06 || state == 0x0D || state == 0x0E || state == 0x0F) {
-        Serial.printf("[CC1101] GoRx: RX OK @ %lu Hz\n", freqHz);
+    if (state == 0x0D || state == 0x08) {
+        // 0x0D = RX, 0x08 = CALIBRATE (transiciona para RX)
         return true;
     }
 
-    Serial.printf("[CC1101] GoRx: FALHOU, state final=0x%02X\n", state);
+    Serial.printf("[CC1101] GoRx: FALHOU, state=0x%02X\n", state);
     return false;
 }
 
@@ -707,6 +721,7 @@ void cc1101CaptureLoop() {
         if (ms != 0x0D && ms != 0x0E && ms != 0x0F) {
             Serial.printf("[CC1101] CAPLOOP: estado errado 0x%02X, reentrando RX\n", ms);
             isr_enabled = false;
+            // Se chip em SLEEP (0x00), GoRx faz reset completo automaticamente
             cc1101GoRx(currentCapture.frequency);
             isr_last_val = digitalRead(CC1101_GDO0);
             isr_last_change = micros();
