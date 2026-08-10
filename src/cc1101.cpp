@@ -3,7 +3,7 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 Driver - SPI DEDICADO HSPI com CS MANUAL (v19 FINAL)
+// CC1101 Driver - SPI DEDICADO HSPI com CS MANUAL (v20 FINAL)
 // ============================================================
 
 // Registradores — ENDERECOS CORRETOS (datasheet SWRS061C)
@@ -167,8 +167,19 @@ static void cc1101SpiStart() {
 
 static void cc1101SpiEnd() {}
 
+// Aguarda MISO ir para LOW (CHIP_RDYn). Timeout de 1ms.
+static bool waitMisoReady() {
+    uint32_t start = micros();
+    while (digitalRead(CC1101_MISO) != LOW) {
+        if (micros() - start > 1000) {
+            return false;  // timeout: chip não respondeu
+        }
+    }
+    return true;
+}
+
 // ============================================================
-// SPI PRIMITIVES (delay fixo, sem waitMiso)
+// SPI PRIMITIVES (com waitMisoReady antes de cada comando)
 // ============================================================
 
 uint8_t cc1101ReadReg(uint8_t reg) {
@@ -176,7 +187,7 @@ uint8_t cc1101ReadReg(uint8_t reg) {
     uint8_t tx[2] = {(uint8_t)(reg | CC1101_READ_SINGLE), 0x00};
     uint8_t rx[2] = {0, 0};
     digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(10);
+    waitMisoReady();                         // aguarda chip pronto
     cc1101SPI.transferBytes(tx, rx, 2);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
@@ -188,7 +199,7 @@ uint8_t cc1101ReadStatus(uint8_t reg) {
     uint8_t tx[2] = {(uint8_t)(reg | CC1101_READ_BURST), CC1101_SNOP};
     uint8_t rx[2] = {0, 0};
     digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(10);
+    waitMisoReady();
     cc1101SPI.transferBytes(tx, rx, 2);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
@@ -200,7 +211,7 @@ void cc1101WriteReg(uint8_t reg, uint8_t value) {
     uint8_t tx[2] = {reg, value};
     uint8_t rx[2];
     digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(10);
+    waitMisoReady();
     cc1101SPI.transferBytes(tx, rx, 2);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
@@ -213,7 +224,7 @@ static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
     for (uint8_t i = 0; i < len && i < 8; i++) tx[i + 1] = data[i];
     uint8_t rx[9];
     digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(10);
+    waitMisoReady();
     cc1101SPI.transferBytes(tx, rx, len + 1);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
@@ -223,7 +234,7 @@ static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
 void cc1101SendCommand(uint8_t cmd) {
     cc1101SpiStart();
     digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(10);
+    waitMisoReady();
     cc1101SPI.transfer(cmd);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
@@ -298,20 +309,20 @@ void cc1101Sleep();
 bool cc1101Wake();
 
 // ============================================================
-// RESET
+// RESET - sequência idêntica à ELECHOUSE
 // ============================================================
 static bool cc1101Reset() {
     cc1101SpiStart();
     digitalWrite(CC1101_CSN, HIGH);
-    delayMicroseconds(2);
+    delay(1);
     digitalWrite(CC1101_CSN, LOW);
     delay(1);
     digitalWrite(CC1101_CSN, HIGH);
     delay(1);
     digitalWrite(CC1101_CSN, LOW);
-    delayMicroseconds(10);
+    waitMisoReady();                      // aguarda MISO=LOW
     cc1101SPI.transfer(CC1101_SRES);
-    delayMicroseconds(150);
+    waitMisoReady();                      // aguarda reset terminar
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
     delay(1);
@@ -349,7 +360,7 @@ static void cc1101ConfigureRegs() {
     cc1101WriteReg(CC1101_TEST2,    0x81);
     cc1101WriteReg(CC1101_TEST1,    0x35);
     cc1101WriteReg(CC1101_TEST0,    0x09);
-    cc1101WriteReg(CC1101_PKTCTRL1, 0x00);   // <--- CORRIGIDO
+    cc1101WriteReg(CC1101_PKTCTRL1, 0x00);   // <--- ADR_CHK = 0
     cc1101WriteReg(CC1101_ADDR,     0x00);
     cc1101WriteReg(CC1101_PKTLEN,   0x00);
     uint8_t paTable[8] = {0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
@@ -408,7 +419,7 @@ bool cc1101Init() {
     Serial.flush();
 
     // Diagnostico resumido
-    Serial.println("[CC1101] === DIAGNOSTICO v19 ===");
+    Serial.println("[CC1101] === DIAGNOSTICO v20 ===");
     Serial.printf("  FSCTRL1=0x%02X FREND1=0x%02X IOCFG0=0x%02X IOCFG2=0x%02X\n",
         cc1101ReadReg(CC1101_FSCTRL1), cc1101ReadReg(CC1101_FREND1),
         cc1101ReadReg(CC1101_IOCFG0), cc1101ReadReg(CC1101_IOCFG2));
@@ -647,7 +658,7 @@ uint32_t cc1101GetCurrentFreq() { return currentCapture.frequency / 1000000; }
 uint8_t cc1101GetPinState() { return digitalRead(CC1101_GDO0); }
 
 // ============================================================
-// REPLAY
+// REPLAY, JAMMER, etc. (mantidos inalterados)
 // ============================================================
 void cc1101ReplaySignal(uint8_t index) {
     if (index >= savedSignalCount || !savedSignals[index].valid) return;
@@ -729,7 +740,7 @@ void cc1101StopSubGHzJammer() {
 }
 
 // ============================================================
-// ROLLJAM (inalterado, exceto Wake/Sleep)
+// ROLLJAM (inalterado)
 // ============================================================
 void cc1101StartRollJam() {
     if (!cc1101Initialized) return;
