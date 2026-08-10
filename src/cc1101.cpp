@@ -2,25 +2,37 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 Driver — SPI dedicado em HSPI (separado do NRF24)
-// 
-// FATOS:
-//   - Registradores verificados contra datasheet SWRS061C
-//   - SPI: usa instância própria SPIClass(HSPI) — NÃO compartilha
-//     barramento com NRF24 (que usa FSPI global)
-//   - Barramento inicializado UMA VEZ e mantido vivo (sem SPI.end())
-//   - Sem beginTransaction() — desnecessário com barramento exclusivo
-//   - Sem SCAL — faz chip ir para SLEEP no ESP32
-//   - Calibração por banda (FSCTRL0/TEST0) como ELECHOUSE
+// CC1101 Driver — SPI DEDICADO HSPI com CS MANUAL (v14)
+//
+// CAUSA RAIZ DOS PROBLEMAS ANTERIORES:
+//
+// 1. BUS CONFLITO: O global SPI no ESP32 Arduino v2.0.x
+//    mapeia para HSPI (SPI2) — MESMO periférico que o CC1101.
+//    Quando nrf24.cpp chamava SPI.begin(), destruía a config do CC1101.
+//    FIX: CC1101 usa SPIClass(HSPI) próprio, NRF24 usa SPIClass(VSPI).
+//
+// 2. CS QUEBRADO: cc1101SPI.begin(..., 15) fazia o driver SPI
+//    assumir o GPIO 15. Os digitalWrite(CSN) viravam NO-OP.
+//    Cada transfer() gerava ciclo CS separado → leituras de registradores
+//    de 2+ bytes ficavam quebradas (CS HIGH entre bytes).
+//    FIX: begin(..., -1) → driver NÃO gerencia CS.
+//    transferBytes() faz transferência atômica multi-byte.
+//
+// 3. testAllPins() DESTRUIA GPIO MATRIX: pinMode() nos pinos HSPI
+//    sobrescrevia a rotação do GPIO matrix.
+//    FIX: testAllPins() agora pula pinos SPI.
+//
+// 4. GoRx FALHAVA MESMO NO BOOT: O estado 0x00 após SRX era causado
+//    pelo problema #2 (registradores mal escritos → chip não entrava RX).
 // ============================================================
 
 // Registradores — ENDEREÇOS CORRETOS (datasheet SWRS061C)
 #define CC1101_IOCFG2   0x00
 #define CC1101_IOCFG0   0x02
 #define CC1101_FIFOTHR  0x03
-#define CC1101_FSCTRL1  0x0B  // ERA 0x07 (FIFOTHR!) — CORRIGIDO
+#define CC1101_FSCTRL1  0x0B
 #define CC1101_FSCTRL0  0x0C
-#define CC1101_PKTCTRL1 0x07  // ERA 0x09 (ADDR!) — CORRIGIDO
+#define CC1101_PKTCTRL1 0x07
 #define CC1101_PKTCTRL0 0x08
 #define CC1101_ADDR     0x09
 #define CC1101_CHANNR   0x0A
@@ -47,7 +59,7 @@
 #define CC1101_FSCAL2   0x24
 #define CC1101_FSCAL1   0x25
 #define CC1101_FSCAL0   0x26
-#define CC1101_FSTEST   0x29  // ERA 0x2B — CORRIGIDO
+#define CC1101_FSTEST   0x29
 #define CC1101_TEST2    0x2C
 #define CC1101_TEST1    0x2D
 #define CC1101_TEST0    0x2E
@@ -134,82 +146,122 @@ void IRAM_ATTR cc1101ISR() {
 }
 
 // ============================================================
-// SPI — BARRAMENTO DEDICADO HSPI (separado do NRF24 em FSPI)
-// 
-// ANTIGO PROBLEMA: CC1101 e NRF24 compartilhavam o objeto global SPI
-// (FSPI). CC1101 chamava SPI.end() a cada acesso, destruindo o
-// barramento que o NRF24 usava. GPIO 12 (MISO) é ADC2_CH2 e era
-// capturado pelo WiFi após SPI.end(). Resultado: leituras zeradas.
+// SPI — BARRAMENTO DEDICADO HSPI (SPI2) com CS MANUAL
 //
-// FIX: CC1101 usa HSPI (periférico SPI2) com instância própria.
-// Os pinos 14/12/13/15 são EXATAMENTE os pinos default do HSPI.
-// NRF24 continua no FSPI global. Nunca mais se interferem.
+// CS=-1 no begin(): O driver SPI NÃO gerencia o pino CS.
+// Isso permite digitalWrite(CSN, LOW/HIGH) funcionar corretamente.
+//
+// transferBytes(): Envia/recebe N bytes em UMA única transação
+// de hardware (CS fica LOW o tempo todo). Necessário para
+// leitura/escrita de registradores do CC1101 (2+ bytes).
 // ============================================================
 
 static SPIClass cc1101SPI(HSPI);
 static bool cc1101BusInitialized = false;
 
+bool cc1101NeedsSpiReinit = false;
+
+static void cc1101SpiForceReinit() {
+    cc1101SPI.end();
+    delay(1);
+    // Configura pinos CSN como GPIO manual ANTES do begin()
+    // para garantir estado determinístico
+    pinMode(CC1101_CSN, OUTPUT);
+    digitalWrite(CC1101_CSN, HIGH);
+    delay(1);
+    // CS=-1: driver NÃO gerencia CS → digitalWrite funciona
+    cc1101SPI.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, -1);
+    cc1101SPI.setFrequency(4000000);
+    cc1101BusInitialized = true;
+    Serial.println("[CC1101] SPI: HSPI reinicializado (CS manual)");
+    Serial.flush();
+}
+
 static void cc1101SpiStart() {
-    if (!cc1101BusInitialized) {
-        cc1101SPI.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
-        cc1101SPI.setFrequency(4000000);  // 4 MHz — seguro para CC1101
-        cc1101BusInitialized = true;
+    if (!cc1101BusInitialized || cc1101NeedsSpiReinit) {
+        cc1101SpiForceReinit();
+        cc1101NeedsSpiReinit = false;
     }
 }
 
 static void cc1101SpiEnd() {
     // NÃO chama end(). O barramento HSPI permanece inicializado.
-    // Isso é seguro porque HSPI é exclusivo do CC1101.
 }
 
-static void waitMisoReady() {
-    while (digitalRead(CC1101_MISO) != LOW) { yield(); }
+// Aguarda MISO ir para LOW (CHIP_RDYn). Retorna false se timeout.
+static bool waitMisoReady(uint16_t timeoutMs = 100) {
+    unsigned long start = millis();
+    while (digitalRead(CC1101_MISO) != LOW) {
+        if (millis() - start > timeoutMs) {
+            Serial.println("[CC1101] WARN: MISO timeout!");
+            return false;
+        }
+        yield();
+    }
+    return true;
 }
 
 // ============================================================
-// SPI PRIMITIVES
+// SPI PRIMITIVES — usam transferBytes() para transações atômicas
+//
+// ANTES (quebrado):
+//   digitalWrite(CSN, LOW);
+//   cc1101SPI.transfer(reg | 0x80);  // CS HIGH após esta linha!
+//   val = cc1101SPI.transfer(0x00);   // Nova transação CS LOW
+//   digitalWrite(CSN, HIGH);
+//
+// DEPOIS (corrigido):
+//   digitalWrite(CSN, LOW);
+//   uint8_t tx[2] = {reg | 0x80, 0x00};
+//   uint8_t rx[2];
+//   cc1101SPI.transferBytes(tx, rx, 2);  // CS fica LOW todo o tempo
+//   digitalWrite(CSN, HIGH);
 // ============================================================
 
 uint8_t cc1101ReadReg(uint8_t reg) {
     cc1101SpiStart();
+    uint8_t tx[2] = {(uint8_t)(reg | CC1101_READ_SINGLE), 0x00};
+    uint8_t rx[2] = {0, 0};
     digitalWrite(CC1101_CSN, LOW);
-    waitMisoReady();
-    cc1101SPI.transfer(reg | CC1101_READ_SINGLE);
-    uint8_t val = cc1101SPI.transfer(0x00);
+    if (!waitMisoReady()) { digitalWrite(CC1101_CSN, HIGH); return 0x00; }
+    cc1101SPI.transferBytes(tx, rx, 2);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
-    return val;
+    return rx[1];
 }
 
 uint8_t cc1101ReadStatus(uint8_t reg) {
     cc1101SpiStart();
+    uint8_t tx[2] = {(uint8_t)(reg | CC1101_READ_BURST), 0x00};
+    uint8_t rx[2] = {0, 0};
     digitalWrite(CC1101_CSN, LOW);
-    waitMisoReady();
-    cc1101SPI.transfer(reg | CC1101_READ_BURST);
-    uint8_t val = cc1101SPI.transfer(0x00);
+    if (!waitMisoReady()) { digitalWrite(CC1101_CSN, HIGH); return 0x00; }
+    cc1101SPI.transferBytes(tx, rx, 2);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
-    return val;
+    return rx[1];
 }
 
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
     cc1101SpiStart();
+    uint8_t tx[2] = {reg, value};
+    uint8_t rx[2];
     digitalWrite(CC1101_CSN, LOW);
-    waitMisoReady();
-    cc1101SPI.transfer(reg);
-    cc1101SPI.transfer(value);
+    if (!waitMisoReady()) { digitalWrite(CC1101_CSN, HIGH); return; }
+    cc1101SPI.transferBytes(tx, rx, 2);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
 }
 
 static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
     cc1101SpiStart();
+    uint8_t tx[9];
+    tx[0] = reg | CC1101_WRITE_BURST;
+    for (uint8_t i = 0; i < len && i < 8; i++) tx[i + 1] = data[i];
+    uint8_t rx[9];
     digitalWrite(CC1101_CSN, LOW);
-    waitMisoReady();
-    cc1101SPI.transfer(reg | CC1101_WRITE_BURST);
-    for (uint8_t i = 0; i < len; i++) {
-        cc1101SPI.transfer(data[i]);
-    }
+    if (!waitMisoReady()) { digitalWrite(CC1101_CSN, HIGH); return false; }
+    cc1101SPI.transferBytes(tx, rx, len + 1);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
     return true;
@@ -217,9 +269,10 @@ static bool cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
 
 void cc1101SendCommand(uint8_t cmd) {
     cc1101SpiStart();
+    uint8_t rx;
     digitalWrite(CC1101_CSN, LOW);
-    waitMisoReady();
-    cc1101SPI.transfer(cmd);
+    if (!waitMisoReady()) { digitalWrite(CC1101_CSN, HIGH); return; }
+    cc1101SPI.transfer(&cmd, &rx, 1);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
 }
@@ -279,7 +332,7 @@ static void cc1101CalibrateBand(float freqMHz) {
     }
 }
 
-// Seta frequência com calibração por banda (sem SCAL)
+// Seta frequência com calibração por banda
 static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
     cc1101SendCommand(CC1101_SIDLE);
@@ -294,21 +347,32 @@ void cc1101Sleep();
 bool cc1101Wake();
 
 // ============================================================
-// RESET — idêntico ao ELECHOUSE Reset()
+// RESET — sequência do datasheet
 // ============================================================
 static bool cc1101Reset() {
     cc1101SpiStart();
+    // Pulso CSN para acordar o chip do SLEEP
     digitalWrite(CC1101_CSN, HIGH);
-    digitalWrite(CC1101_SCK, HIGH);
-    digitalWrite(CC1101_MOSI, LOW);
+    delayMicroseconds(2);
     digitalWrite(CC1101_CSN, LOW);
     delay(1);
     digitalWrite(CC1101_CSN, HIGH);
     delay(1);
+    // Envio do comando SRES
+    uint8_t tx = CC1101_SRES;
+    uint8_t rx;
     digitalWrite(CC1101_CSN, LOW);
-    waitMisoReady();
-    cc1101SPI.transfer(CC1101_SRES);
-    waitMisoReady();
+    if (!waitMisoReady()) {
+        Serial.println("[CC1101] RESET: MISO timeout no wake");
+        digitalWrite(CC1101_CSN, HIGH);
+        return false;
+    }
+    cc1101SPI.transfer(&tx, &rx, 1);
+    if (!waitMisoReady(200)) {
+        Serial.println("[CC1101] RESET: MISO timeout pos-SRES");
+        digitalWrite(CC1101_CSN, HIGH);
+        return false;
+    }
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
     delay(1);
@@ -317,26 +381,22 @@ static bool cc1101Reset() {
 
 // ============================================================
 // CONFIGURAÇÃO — idêntica ao ELECHOUSE RegConfigSettings()
-// + setCCMode(0) + setModulation(2) + setRxBW(500)
 // ============================================================
 static void cc1101ConfigureRegs() {
-    // setCCMode(0): modo async serial
     cc1101WriteReg(CC1101_IOCFG2,   0x0D);
     cc1101WriteReg(CC1101_IOCFG0,   0x0D);
     cc1101WriteReg(CC1101_PKTCTRL0, 0x32);
     cc1101WriteReg(CC1101_MDMCFG3,  0x93);
     cc1101WriteReg(CC1101_MDMCFG4,  0x07);
-    // setModulation(2) = ASK/OOK
     cc1101WriteReg(CC1101_MDMCFG2,  0x30);
     cc1101WriteReg(CC1101_FREND0,   0x11);
-    // RegConfigSettings
     cc1101WriteReg(CC1101_FSCTRL1,  0x06);
     cc1101WriteReg(CC1101_MDMCFG1,  0x02);
     cc1101WriteReg(CC1101_MDMCFG0,  0xF8);
     cc1101WriteReg(CC1101_CHANNR,   0x00);
     cc1101WriteReg(CC1101_DEVIATN,  0x47);
     cc1101WriteReg(CC1101_FREND1,   0x56);
-    cc1101WriteReg(CC1101_MCSM0,    0x18);
+    cc1101WriteReg(CC1101_MCSM0,    0x38);
     cc1101WriteReg(CC1101_FOCCFG,   0x16);
     cc1101WriteReg(CC1101_BSCFG,    0x1C);
     cc1101WriteReg(CC1101_AGCCTRL2, 0xC7);
@@ -353,9 +413,7 @@ static void cc1101ConfigureRegs() {
     cc1101WriteReg(CC1101_PKTCTRL1, 0x04);
     cc1101WriteReg(CC1101_ADDR,     0x00);
     cc1101WriteReg(CC1101_PKTLEN,   0x00);
-    // setRxBW(500) → MDMCFG4 = 0x27
     cc1101WriteReg(CC1101_MDMCFG4,  0x27);
-    // PATABLE — OOK: PA[0]=0x00 (OFF), PA[1]=0xC0 (ON)
     uint8_t paTable[8] = {0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
     cc1101WriteRegBurst(CC1101_PATABLE, paTable, 8);
 }
@@ -366,11 +424,14 @@ static void cc1101ConfigureRegs() {
 bool cc1101Init() {
     Serial.println("[CC1101] Inicializando...");
     Serial.flush();
+    // Configura CSN como GPIO ANTES do begin() — garante controle manual
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
     pinMode(CC1101_GDO0, INPUT_PULLUP);
     pinMode(CC1101_GDO2, INPUT);
     delay(10);
+    // Inicializa HSPI com CS manual (-1)
+    cc1101SpiForceReinit();
     if (!cc1101Reset()) {
         Serial.println("[CC1101] FAIL: reset falhou");
         return false;
@@ -415,19 +476,25 @@ void cc1101Sleep() {
     delay(1);
     cc1101SendCommand(CC1101_SPWD);
     cc1101Awake = false;
-    Serial.println("[CC1101] Modulo em SLEEP (desativado)");
+    Serial.println("[CC1101] Modulo em SLEEP");
 }
 
 bool cc1101Wake() {
     if (!cc1101Initialized) return false;
     Serial.println("[CC1101] WAKE: acordando modulo...");
     Serial.flush();
+    // Re-inicializa o barramento HSPI a cada wake para garantir
+    // que os pinos estejam corretos (proteção contra testAllPins/WiFi)
+    cc1101NeedsSpiReinit = true;
+    cc1101SpiStart();
     if (!cc1101Reset()) {
         Serial.println("[CC1101] WAKE: reset falhou!");
         cc1101Awake = false;
         return false;
     }
     cc1101ConfigureRegs();
+    detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
+    pinMode(CC1101_GDO0, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
     uint8_t state = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
     uint8_t version = cc1101ReadStatus(CC1101_VERSION);
@@ -444,8 +511,7 @@ bool cc1101Wake() {
 }
 
 // ============================================================
-// GoRx — entra em RX com logging detalhado
-// Sequência idêntica ao ELECHOUSE SetRx(): SIDLE → SRX
+// GoRx — entra em RX com retry e delay seguro (errata SWRZ020)
 // ============================================================
 static bool cc1101GoRx(uint32_t freqHz) {
     uint8_t state;
@@ -471,14 +537,34 @@ static bool cc1101GoRx(uint32_t freqHz) {
     Serial.printf("[CC1101] GoRx S2: pos-cal=0x%02X\n", state);
 
     cc1101SendCommand(CC1101_SIDLE);
+    delayMicroseconds(100);
     cc1101SendCommand(CC1101_SRX);
     Serial.println("[CC1101] GoRx S3: SRX enviado, aguardando...");
 
-    delay(2);
+    // Errata SWRZ020: delay >5ms antes de ler MARCSTATE
+    delay(5);
+
     state = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
     Serial.printf("[CC1101] GoRx S4: final=0x%02X @ %lu Hz\n", state, freqHz);
 
     if (state == 0x0D || state == 0x08) return true;
+
+    // Retry
+    Serial.printf("[CC1101] GoRx: tentativa 2 com delay extra...\n");
+    delay(10);
+    state = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
+    Serial.printf("[CC1101] GoRx S5: retry=0x%02X\n", state);
+    if (state == 0x0D || state == 0x08) return true;
+
+    // Aceita estados de calibração
+    if (state >= 0x02 && state <= 0x0C) {
+        Serial.printf("[CC1101] GoRx: estado transicao 0x%02X, aguardando...\n", state);
+        delay(10);
+        state = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
+        Serial.printf("[CC1101] GoRx S6: pos-transicao=0x%02X\n", state);
+        if (state == 0x0D || state == 0x08) return true;
+    }
+
     Serial.printf("[CC1101] GoRx FALHOU: state=0x%02X\n", state);
     return false;
 }
