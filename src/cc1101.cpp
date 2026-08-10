@@ -484,7 +484,7 @@ static void cc1101ConfigureRegs() {
     cc1101WriteReg(CC1101_TEST2,    0x81);
     cc1101WriteReg(CC1101_TEST1,    0x35);
     cc1101WriteReg(CC1101_TEST0,    0x09);
-    cc1101WriteReg(CC1101_PKTCTRL1, 0x04);
+    cc1101WriteReg(CC1101_PKTCTRL1, 0x00);   // <--- CORRIGIDO: ADR_CHK=0, sem verificação de endereço
     cc1101WriteReg(CC1101_ADDR,     0x00);
     cc1101WriteReg(CC1101_PKTLEN,   0x00);
     uint8_t paTable[8] = {0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
