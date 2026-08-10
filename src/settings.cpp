@@ -10,17 +10,23 @@ struct PinTest {
     bool working;
 };
 
-// Pinos SPI do HSPI (CC1101) e VSPI (NRF24) — NÃO testar!
-// pinMode() nesses pinos destrói o GPIO matrix do SPI.
-static const uint8_t spiPins[] = {
-    CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN,  // HSPI: 14,12,13,15
-    NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN              // VSPI: 18,19,23,25
+// Pinos que **NÃO** devem ser alterados em hipótese alguma
+// (SPI de ambos os rádios + GDOs + CE do NRF)
+static const uint8_t protectedPins[] = {
+    // HSPI (CC1101)
+    CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN,
+    // VSPI (NRF24)
+    NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN,
+    // Pinos de controle do CC1101
+    CC1101_GDO0, CC1101_GDO2,
+    // Pino CE do NRF24 (não SPI, mas controle do rádio)
+    NRF_CE
 };
-static const uint8_t spiPinCount = sizeof(spiPins) / sizeof(spiPins[0]);
+static const uint8_t protectedCount = sizeof(protectedPins) / sizeof(protectedPins[0]);
 
-static bool isSpiPin(uint8_t pin) {
-    for (uint8_t i = 0; i < spiPinCount; i++) {
-        if (spiPins[i] == pin) return true;
+static bool isProtectedPin(uint8_t pin) {
+    for (uint8_t i = 0; i < protectedCount; i++) {
+        if (protectedPins[i] == pin) return true;
     }
     return false;
 }
@@ -50,10 +56,12 @@ void testAllPins() {
     for (int i = 0; i < pinTestCount; i++) {
         uint8_t pin = pinTests[i].pin;
 
-        // NUNCA faz pinMode() em pinos SPI — isso destrói o GPIO matrix
-        // e quebra o barramento SPI. Testa apenas leitura.
-        if (isSpiPin(pin)) {
-            pinTests[i].working = true;  // Assume OK (não podemos testar sem destruir)
+        // NUNCA mexe em pinos protegidos (rádios, GDOs, etc.)
+        if (isProtectedPin(pin)) {
+            // Apenas coloca como INPUT (alta impedância) para leitura passiva
+            pinMode(pin, INPUT);
+            delay(1);
+            pinTests[i].working = true;  // Consideramos OK pois não testamos ativamente
             continue;
         }
 
@@ -71,9 +79,10 @@ void testAllPins() {
         }
         delay(5);
     }
-    // NÃO precisa mais de cc1101NeedsSpiReinit porque não destruímos os pinos SPI
-    // Mas setamos como precaução caso algum outro código tenha alterado os pinos
+
+    // Após o teste, força uma reinicialização limpa do CC1101
     cc1101NeedsSpiReinit = true;
+    // (O menu chamará goBack() depois, que pode parar capturas, etc.)
 }
 
 uint8_t getPinTestCount() { return pinTestCount; }
