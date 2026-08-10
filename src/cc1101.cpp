@@ -433,7 +433,7 @@ bool cc1101Init() {
     // Configura CSN como GPIO ANTES do begin() — garante controle manual
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
-    pinMode(CC1101_GDO0, INPUT_PULLUP);
+    pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
     delay(10);
     // Inicializa HSPI com CS manual (-1)
@@ -497,8 +497,12 @@ bool cc1101Wake() {
         return false;
     }
     cc1101ConfigureRegs();
-    detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
-    pinMode(CC1101_GDO0, INPUT_PULLUP);
+    // ISR no GDO0 — estilo ELECHOUSE/DIV:
+    // - NAO chama detachInterrupt antes (causa erro "GPIO isr service
+    //   not installed" no ESP32 porque nenhum ISR foi instalado ainda
+    // - Usa INPUT (sem pull-up) igual ao RCSwitch.enableReceive()
+    //   O pull-up pode manter GDO0 HIGH e mascarar transicoes do chip
+    pinMode(CC1101_GDO0, INPUT);
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
     // Estilo ELECHOUSE/DIV: apos reset+configure o chip esta em IDLE.
     // Nao verificamos MARCSTATE — leituras de status register podem
@@ -568,8 +572,14 @@ void cc1101CaptureLoop() {
     if (capture_state == STATE_HOPPING) {
         if (isr_count > 5) {
             capture_state = STATE_LOCKED;
+            Serial.printf("[CC1101] LOCKED freq=%luM, pulses=%d\n", currentCapture.frequency / 1000000, isr_count);
         }
         else if (nowMs - lastFreqSwitch > 1000) {
+            // Debug: mostra estado do GDO0 e contagem do ISR
+            if (isr_count == 0 && !capture_started) {
+                Serial.printf("[CC1101] Hop %luM: GDO0=%d ISR=0\n", 
+                    currentCapture.frequency / 1000000, digitalRead(CC1101_GDO0));
+            }
             isr_enabled = false;
             isr_count = 0;
             capture_started = false;
