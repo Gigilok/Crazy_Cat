@@ -1,6 +1,7 @@
 #include "config.h"
 #include "wifi_api.h"
 #include <WiFi.h>
+#include <SPI.h>
 
 #define LED_PIN 2
 
@@ -63,8 +64,17 @@ void setup() {
     inputInit();
     if (displayOK) showLoading("Botoes OK", 25);
 
-    // 3. NRF24
-    Serial.println("[SETUP] 3. NRF24...");
+    // 3. Inicializa o barramento SPI compartilhado (VSPI) para NRF24 e CC1101
+    Serial.println("[SETUP] Inicializando SPI compartilhado (VSPI)...");
+    SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, -1);  // CS controlado manualmente
+    SPI.setFrequency(8000000);
+    SPI.setDataMode(SPI_MODE0);
+    SPI.setBitOrder(MSBFIRST);
+    delay(10);
+    Serial.println("[SETUP] SPI VSPI OK.");
+
+    // 4. NRF24
+    Serial.println("[SETUP] 4. NRF24...");
     Serial.flush();
     nrf24OK = nrf24Init();
     Serial.printf("[SETUP] NRF24: %s\n", nrf24OK ? "OK" : "FAIL");
@@ -73,16 +83,16 @@ void setup() {
 
     delay(100);
 
-    // 4. CC1101
-    Serial.println("[SETUP] 4. CC1101...");
+    // 5. CC1101 (agora usando ELECHOUSE e mesmo barramento SPI)
+    Serial.println("[SETUP] 5. CC1101...");
     Serial.flush();
     cc1101OK = cc1101Init();
     Serial.printf("[SETUP] CC1101: %s\n", cc1101OK ? "OK" : "FAIL");
     Serial.flush();
     if (displayOK) showLoading(cc1101OK ? "CC1101 OK" : "CC1101 FAIL", 60);
 
-    // 5. WiFi
-    Serial.println("[SETUP] 5. WiFi...");
+    // 6. WiFi
+    Serial.println("[SETUP] 6. WiFi...");
     Serial.flush();
     WiFi.mode(WIFI_AP_STA);
     delay(100);
@@ -92,15 +102,15 @@ void setup() {
     Serial.println("[SETUP] OK: WiFi AP.");
     if (displayOK) showLoading("WiFi OK", 80);
 
-    // 6. API Server
-    Serial.println("[SETUP] 6. API Server...");
+    // 7. API Server
+    Serial.println("[SETUP] 7. API Server...");
     Serial.flush();
     startAPIServer();
     Serial.println("[SETUP] OK: API :8080.");
     if (displayOK) showLoading("Pronto!", 100);
 
-    // 7. Menu
-    Serial.println("[SETUP] 7. Menu...");
+    // 8. Menu
+    Serial.println("[SETUP] 8. Menu...");
     Serial.flush();
     if (displayOK) {
         menuInit();
