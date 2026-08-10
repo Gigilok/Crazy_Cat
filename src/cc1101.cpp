@@ -131,7 +131,7 @@ void IRAM_ATTR cc1101ISR() {
 }
 
 // ============================================================
-// Funções SPI (usando objeto SPI global = VSPI)
+// SPI (usando SPI global = VSPI)
 // ============================================================
 static void cs_low()  { digitalWrite(CC1101_CSN, LOW); }
 static void cs_high() { digitalWrite(CC1101_CSN, HIGH); }
@@ -245,17 +245,19 @@ static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
 // ============================================================
 static bool cc1101Reset() {
     cs_high();
-    delay(1);
+    delay(2);
     cs_low();
-    delay(1);
+    delay(2);
     cs_high();
-    delay(1);
+    delay(2);
     cs_low();
+    delay(1);
     waitMisoReady();
     SPI.transfer(CC1101_SRES);
+    delayMicroseconds(150);
     waitMisoReady();
     cs_high();
-    delay(1);
+    delay(2);
     return true;
 }
 
@@ -287,7 +289,7 @@ static void cc1101ConfigureRegs() {
     cc1101WriteReg(CC1101_TEST2,    0x81);
     cc1101WriteReg(CC1101_TEST1,    0x35);
     cc1101WriteReg(CC1101_TEST0,    0x09);
-    cc1101WriteReg(CC1101_PKTCTRL1, 0x00);   // ADR_CHK = 0
+    cc1101WriteReg(CC1101_PKTCTRL1, 0x00);
     cc1101WriteReg(CC1101_ADDR,     0x00);
     cc1101WriteReg(CC1101_PKTLEN,   0x00);
     uint8_t paTable[8] = {0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
@@ -312,18 +314,18 @@ bool cc1101Init() {
     pinMode(CC1101_GDO2, INPUT);
     delay(10);
 
-    // SPI já foi iniciado no main.cpp (VSPI)
     cc1101Reset();
-    cc1101ConfigureRegs();
 
     uint8_t partnum = cc1101ReadStatus(CC1101_PARTNUM);
     uint8_t version = cc1101ReadStatus(CC1101_VERSION);
     Serial.printf("[CC1101] PARTNUM=0x%02X VERSION=0x%02X\n", partnum, version);
+
     if (partnum == 0xFF || version == 0xFF) {
         Serial.println("[CC1101] FAIL: modulo nao responde");
         return false;
     }
 
+    cc1101ConfigureRegs();
     cc1101Initialized = true;
     cc1101SendCommand(CC1101_SIDLE);
     Serial.println("[CC1101] OK");
@@ -351,7 +353,7 @@ bool cc1101Wake() {
 }
 
 // ============================================================
-// GoRx com espera ativa por RX
+// GoRx
 // ============================================================
 static bool cc1101GoRx(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
@@ -520,7 +522,7 @@ uint32_t cc1101GetCurrentFreq() { return currentCapture.frequency / 1000000; }
 uint8_t cc1101GetPinState() { return digitalRead(CC1101_GDO0); }
 
 // ============================================================
-// Replay (TX)
+// Replay
 // ============================================================
 void cc1101ReplaySignal(uint8_t index) {
     if (index >= savedSignalCount || !savedSignals[index].valid) return;
@@ -529,7 +531,7 @@ void cc1101ReplaySignal(uint8_t index) {
     isr_enabled = false;
     SignalData* sig = &savedSignals[index];
     cc1101SetFrequencyCalibrated(sig->frequency);
-    cc1101WriteReg(CC1101_IOCFG0, 0x2E);   // GDO0 como saída digital
+    cc1101WriteReg(CC1101_IOCFG0, 0x2E);
     cc1101SendCommand(CC1101_SIDLE); delay(1);
     cc1101SendCommand(CC1101_STX); delay(1);
     pinMode(CC1101_GDO0, OUTPUT);
@@ -545,9 +547,6 @@ void cc1101ReplaySignal(uint8_t index) {
     cc1101Sleep();
 }
 
-// ============================================================
-// Brute Force (mantido para compatibilidade)
-// ============================================================
 void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
     if (!cc1101Initialized) return;
     if (!cc1101Wake()) return;
@@ -687,7 +686,7 @@ void cc1101StopRollJam() {
 }
 
 // ============================================================
-// Analisador de Espectro
+// Analisador de espectro
 // ============================================================
 void cc1101StartAnalyzer() {
     if (!cc1101Initialized) return;
@@ -740,7 +739,7 @@ uint32_t cc1101GetAnalyzerFreq(int idx) {
 uint8_t cc1101GetAnalyzerSelected() { return spec_an_idx; }
 
 // ============================================================
-// Gerenciamento de sinais salvos
+// Gerenciamento de sinais
 // ============================================================
 void cc1101ClearSavedSignals() {
     savedSignalCount = 0;
