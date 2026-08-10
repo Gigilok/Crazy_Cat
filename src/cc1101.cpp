@@ -272,7 +272,7 @@ void cc1101SendCommand(uint8_t cmd) {
     uint8_t rx;
     digitalWrite(CC1101_CSN, LOW);
     if (!waitMisoReady()) { digitalWrite(CC1101_CSN, HIGH); return; }
-    cc1101SPI.transfer(&cmd, &rx, 1);
+    rx = cc1101SPI.transfer(cmd);
     digitalWrite(CC1101_CSN, HIGH);
     cc1101SpiEnd();
 }
@@ -367,7 +367,7 @@ static bool cc1101Reset() {
         digitalWrite(CC1101_CSN, HIGH);
         return false;
     }
-    cc1101SPI.transfer(&tx, &rx, 1);
+    rx = cc1101SPI.transfer(tx);
     if (!waitMisoReady(200)) {
         Serial.println("[CC1101] RESET: MISO timeout pos-SRES");
         digitalWrite(CC1101_CSN, HIGH);
