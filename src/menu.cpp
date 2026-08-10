@@ -37,6 +37,7 @@ extern ButtonState readButtons();
 extern bool nrf24IsAvailable();
 extern void nrf24StartJammer();
 extern void nrf24StopJammer();
+extern void nrf24Sleep();
 extern void nrf24StartScan();
 extern void nrf24StopScan();
 extern void nrf24ScanLoop();
@@ -285,11 +286,25 @@ void goBack() {
         case MENU_SETTINGS_RECORDS_DELETE: enterMenu(MENU_SETTINGS_RECORDS_DETAIL); break;
         default: enterMenu(MENU_MAIN); break;
     }
+    // POWER DOWN NRF24 ao sair de QUALQUER menu NRF24.
+    // Isso garante que o NRF24 libere o barramento VSPI
+    // e não interfira com o CC1101 (HSPI).
+    bool wasInNrf24Menu = (currentMenu == MENU_NRF24_JAMMER ||
+        currentMenu == MENU_NRF24_SCANNER || currentMenu == MENU_NRF24_ANALYZE ||
+        currentMenu == MENU_NRF24_ANALYZE_DETAIL || currentMenu == MENU_NRF24);
+
     if (nrf24JammerActive) { nrf24StopJammer(); }
     if (nrf24IsScanning()) nrf24StopScan();
     if (scannerRunning) nrf24SpecStop();
     if (nrf24IsAnalyzing()) nrf24StopAnalyze();
     scannerRunning = false;
+
+    // Se estava em qualquer menu NRF24, faz powerDown completo.
+    // nrf24Sleep() internamente: para atividades + radio.powerDown().
+    if (wasInNrf24Menu) {
+        nrf24Sleep();
+        Serial.println("[MENU] NRF24 powerDown ao sair do menu NRF24");
+    }
     if (deauthActive) stopDeauth();
     if (cameraFreezeActive) stopCameraFreeze();
     if (droneJammerActive) stopDroneJammer();
