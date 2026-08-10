@@ -444,12 +444,21 @@ bool cc1101Init() {
         Serial.println(version, HEX);
         Serial.flush();
 
-        // CC1101 genuino: PARTNUM=0x00, VERSION=0x04 (rev B) ou 0x14 (rev C/E)
-        // Aceitamos qualquer valor != 0x00 e != 0xFF como "respondeu".
-        if (partnum != 0xFF && partnum != 0x00) {
-            break;  // sucesso
-        }
-        if (version != 0xFF && version != 0x00) {
+        // CC1101 genuino (datasheet):
+        //   PARTNUM  = 0x00 (sempre 0x00 para CC1101 — identifica o chip)
+        //   VERSION  = 0x04 (rev B) ou 0x14 (rev E/F) — qualquer valor
+        //              != 0x00 e != 0xFF indica que o chip respondeu.
+        //
+        // Validacao correta:
+        //   - partnum == 0x00 E version != 0x00 E version != 0xFF -> OK
+        //   - partnum == 0xFF -> MISO em HIGH (chip nao responde / NRF24 segurando)
+        //   - version == 0xFF -> idem
+        //   - version == 0x00 -> MISO em LOW (chip nao alimentado ou CSN nao chega)
+        if (partnum == 0x00 && version != 0x00 && version != 0xFF) {
+            Serial.print(F("[CC1101] CC1101 rev "));
+            Serial.print((version & 0xF0) >> 4, HEX);
+            Serial.print(F("."));
+            Serial.println(version & 0x0F, HEX);
             break;  // sucesso
         }
 
@@ -457,8 +466,22 @@ bool cc1101Init() {
         delay(100);
     }
 
-    if (partnum == 0xFF || partnum == 0x00) {
-        Serial.println(F("[CC1101] FAIL: modulo nao responde (PARTNUM invalido)"));
+    // Validacao final: CC1101 respondeu?
+    // PARTNUM deve ser 0x00 e VERSION deve ser != 0x00 e != 0xFF
+    if (partnum != 0x00 || version == 0x00 || version == 0xFF) {
+        Serial.println(F("[CC1101] FAIL: modulo nao responde"));
+        Serial.println(F("[CC1101] Valores lidos:"));
+        Serial.print(F("  PARTNUM = 0x"));
+        Serial.print(partnum, HEX);
+        Serial.print(F(" (esperado: 0x00)"));
+        if (partnum == 0xFF) Serial.print(F(" <- MISO em HIGH (barramento ocupado)"));
+        Serial.println();
+        Serial.print(F("  VERSION = 0x"));
+        Serial.print(version, HEX);
+        Serial.print(F(" (esperado: 0x04 ou 0x14)"));
+        if (version == 0xFF) Serial.print(F(" <- MISO em HIGH"));
+        else if (version == 0x00) Serial.print(F(" <- MISO em LOW (chip sem alimentacao?)"));
+        Serial.println();
         Serial.println(F("[CC1101] Verifique:"));
         Serial.println(F("  - Fios SCK/MOSI/MISO/CSN conectados"));
         Serial.println(F("  - Alimentacao 3.3V (NAO 5V!)"));
