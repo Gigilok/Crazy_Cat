@@ -4,7 +4,7 @@
 #include <Arduino.h>
 
 // ============================================================
-// PINOS - Crazy Cat v3.1
+// PINOS - Crazy Cat v3.1 (CC1101 agora no VSPI)
 // ============================================================
 #define OLED_SCK    22
 #define OLED_SDA    21
@@ -20,11 +20,12 @@
 #define NRF_MOSI    23
 #define NRF_MISO    19
 
+// CC1101 agora no mesmo barramento VSPI do NRF24
 #define CC1101_GDO0 17
 #define CC1101_CSN  15
-#define CC1101_SCK  14
-#define CC1101_MOSI 13
-#define CC1101_MISO 12
+#define CC1101_SCK  18    // VSPI SCK
+#define CC1101_MOSI 23    // VSPI MOSI
+#define CC1101_MISO 19    // VSPI MISO
 #define CC1101_GDO2 16
 
 #define BUZZER_PIN  4
@@ -32,23 +33,10 @@
 // ============================================================
 // BATERIA - medidor de carga
 // ============================================================
-// Pino ADC para leitura da tensao da bateria LiPo 3.7V (1S).
-// GPIO 34 (ADC1_CH6) e input-only, seguro para leitura analogica.
-//
-// HARDWARE NECESSARIO: divisor de tensao 2:1 com 2 resistores de 100kΩ:
-//   BATERIA LiPo (+) ──[100kΩ]── GPIO34 ──[100kΩ]── GND
-//
-// IMPORTANTE: o fio do divisor deve ir DIRETO no + da bateria LiPo,
-// ANTES do modulo de carga. Assim medimos a tensao real da celula,
-// nao a tensao regulada de 5V (que e sempre constante).
-//
-// Com divisor 2:1, o GPIO34 recebe:
-//   - 4.2V (bateria cheia)  -> 2.1V no GPIO (seguro, limite e 3.3V)
-//   - 3.0V (bateria fraca)  -> 1.5V no GPIO
 #define BATTERY_PIN         34
-#define BATTERY_DIVIDER     2.0     // fator do divisor (Vin = Vadc * 2.0)
-#define BATTERY_FULL_MV     4200    // 100% (LiPo cheia = 4.2V)
-#define BATTERY_EMPTY_MV    3000    // 0%   (LiPo descarregada = 3.0V)
+#define BATTERY_DIVIDER     2.0
+#define BATTERY_FULL_MV     4200
+#define BATTERY_EMPTY_MV    3000
 
 // ============================================================
 // CONFIGURACOES
@@ -58,7 +46,7 @@
 #define OLED_ADDRESS    0x3C
 
 #define MAX_SAVED_SIGNALS   5
-#define CAPTURE_DURATION    8000 
+#define CAPTURE_DURATION    8000
 #define MAX_NETWORKS        20
 #define MAX_BT_DEVICES      15
 
@@ -66,7 +54,7 @@
 // ESTRUTURAS
 // ============================================================
 struct SignalData {
-    uint16_t timings[200]; 
+    uint16_t timings[200];
     uint8_t length;
     uint32_t frequency;
     uint8_t modulation;
@@ -109,8 +97,8 @@ enum MenuState {
     MENU_ATTACK_BLUETOOTH,
     MENU_ATTACK_BRUTEFORCE, MENU_ATTACK_BF_GATE, MENU_ATTACK_BF_CAR,
     MENU_NETWORKS, MENU_NET_PASSWORD, MENU_NET_DEAUTH, MENU_NET_REMOTE,
-    MENU_SETTINGS, MENU_SETTINGS_PINS, MENU_SETTINGS_MODULES, MENU_SETTINGS_BRIGHTNESS, 
-    MENU_SETTINGS_RECORDS, MENU_SETTINGS_RECORDS_DETAIL, MENU_SETTINGS_RECORDS_DELETE, 
+    MENU_SETTINGS, MENU_SETTINGS_PINS, MENU_SETTINGS_MODULES, MENU_SETTINGS_BRIGHTNESS,
+    MENU_SETTINGS_RECORDS, MENU_SETTINGS_RECORDS_DETAIL, MENU_SETTINGS_RECORDS_DELETE,
     MENU_SETTINGS_WIFI, MENU_SETTINGS_CONNECTION
 };
 
