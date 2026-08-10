@@ -1,10 +1,65 @@
 #include <SPI.h>
 #include <driver/gpio.h>
 #include "config.h"
-#include "ELECHOUSE_CC1101_SRC_DRV.h"
 
 // ============================================================
-// VARIÁVEIS GLOBAIS
+// Registradores CC1101
+// ============================================================
+#define CC1101_IOCFG2   0x00
+#define CC1101_IOCFG0   0x02
+#define CC1101_FIFOTHR  0x03
+#define CC1101_FSCTRL1  0x0B
+#define CC1101_FSCTRL0  0x0C
+#define CC1101_PKTCTRL1 0x07
+#define CC1101_PKTCTRL0 0x08
+#define CC1101_ADDR     0x09
+#define CC1101_CHANNR   0x0A
+#define CC1101_PKTLEN   0x06
+#define CC1101_FREQ2    0x0D
+#define CC1101_FREQ1    0x0E
+#define CC1101_FREQ0    0x0F
+#define CC1101_MDMCFG4  0x10
+#define CC1101_MDMCFG3  0x11
+#define CC1101_MDMCFG2  0x12
+#define CC1101_MDMCFG1  0x13
+#define CC1101_MDMCFG0  0x14
+#define CC1101_DEVIATN  0x15
+#define CC1101_MCSM0    0x18
+#define CC1101_FOCCFG   0x19
+#define CC1101_BSCFG    0x1A
+#define CC1101_AGCCTRL2 0x1B
+#define CC1101_AGCCTRL1 0x1C
+#define CC1101_AGCCTRL0 0x1D
+#define CC1101_FREND1   0x21
+#define CC1101_FREND0   0x22
+#define CC1101_FSCAL3   0x23
+#define CC1101_FSCAL2   0x24
+#define CC1101_FSCAL1   0x25
+#define CC1101_FSCAL0   0x26
+#define CC1101_FSTEST   0x29
+#define CC1101_TEST2    0x2C
+#define CC1101_TEST1    0x2D
+#define CC1101_TEST0    0x2E
+#define CC1101_PARTNUM  0x30
+#define CC1101_VERSION  0x31
+#define CC1101_RSSI     0x34
+#define CC1101_MARCSTATE 0x35
+
+#define CC1101_SRES     0x30
+#define CC1101_SRX      0x34
+#define CC1101_STX      0x35
+#define CC1101_SIDLE    0x36
+#define CC1101_SPWD     0x39
+#define CC1101_SFRX     0x3A
+#define CC1101_PATABLE  0x3E
+#define CC1101_SNOP     0x3D
+
+#define CC1101_READ_SINGLE  0x80
+#define CC1101_READ_BURST   0xC0
+#define CC1101_WRITE_BURST  0x40
+
+// ============================================================
+// Variáveis globais
 // ============================================================
 bool cc1101Initialized = false;
 bool cc1101CopyActive = false;
@@ -49,7 +104,7 @@ uint8_t spec_an_idx = 0;
 bool spec_an_running = false;
 
 // ============================================================
-// ISR (captura RAW)
+// ISR
 // ============================================================
 void IRAM_ATTR cc1101ISR() {
     if (!isr_enabled) return;
@@ -76,111 +131,258 @@ void IRAM_ATTR cc1101ISR() {
 }
 
 // ============================================================
-// WRAPPERS DE COMPATIBILIDADE (para wifi_attacks.cpp e outros)
+// Funções SPI (usando objeto SPI global = VSPI)
 // ============================================================
-void cc1101SetFrequency(uint32_t freqHz) {
-    ELECHOUSE_cc1101.setMHZ(freqHz / 1000000.0f);
+static void cs_low()  { digitalWrite(CC1101_CSN, LOW); }
+static void cs_high() { digitalWrite(CC1101_CSN, HIGH); }
+
+static bool waitMisoReady() {
+    uint32_t start = micros();
+    while (digitalRead(CC1101_MISO) != LOW) {
+        if (micros() - start > 1000) return false;
+    }
+    return true;
+}
+
+uint8_t cc1101ReadReg(uint8_t reg) {
+    cs_low();
+    waitMisoReady();
+    SPI.transfer(reg | CC1101_READ_SINGLE);
+    uint8_t val = SPI.transfer(0x00);
+    cs_high();
+    return val;
+}
+
+uint8_t cc1101ReadStatus(uint8_t reg) {
+    cs_low();
+    waitMisoReady();
+    SPI.transfer(reg | CC1101_READ_BURST);
+    uint8_t val = SPI.transfer(CC1101_SNOP);
+    cs_high();
+    return val;
 }
 
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
-    ELECHOUSE_cc1101.SpiWriteReg(reg, value);
+    cs_low();
+    waitMisoReady();
+    SPI.transfer(reg);
+    SPI.transfer(value);
+    cs_high();
+}
+
+static void cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
+    cs_low();
+    waitMisoReady();
+    SPI.transfer(reg | CC1101_WRITE_BURST);
+    for (uint8_t i = 0; i < len; i++) SPI.transfer(data[i]);
+    cs_high();
 }
 
 void cc1101SendCommand(uint8_t cmd) {
-    ELECHOUSE_cc1101.SpiStrobe(cmd);
+    cs_low();
+    waitMisoReady();
+    SPI.transfer(cmd);
+    cs_high();
 }
 
 // ============================================================
-// INICIALIZAÇÃO
+// Funções auxiliares
+// ============================================================
+void cc1101SetFrequency(uint32_t freqHz) {
+    uint32_t freqWord = (uint32_t)((freqHz / 26000000.0) * 65536);
+    cc1101WriteReg(CC1101_FREQ2, (freqWord >> 16) & 0xFF);
+    cc1101WriteReg(CC1101_FREQ1, (freqWord >> 8) & 0xFF);
+    cc1101WriteReg(CC1101_FREQ0, freqWord & 0xFF);
+}
+
+static void cc1101CalibrateBand(float freqMHz) {
+    if (freqMHz >= 300.0f && freqMHz <= 348.0f) {
+        int fsctrl0_val = (int)(24.0f + (freqMHz - 300.0f) / (348.0f - 300.0f) * (28.0f - 24.0f));
+        cc1101WriteReg(CC1101_FSCTRL0, (uint8_t)fsctrl0_val);
+        if (freqMHz < 322.88f) cc1101WriteReg(CC1101_TEST0, 0x0B);
+        else {
+            cc1101WriteReg(CC1101_TEST0, 0x09);
+            uint8_t s = cc1101ReadReg(CC1101_FSCAL2);
+            if (s < 32) cc1101WriteReg(CC1101_FSCAL2, s + 32);
+        }
+    } else if (freqMHz >= 378.0f && freqMHz <= 464.0f) {
+        int fsctrl0_val = (int)(31.0f + (freqMHz - 378.0f) / (464.0f - 378.0f) * (38.0f - 31.0f));
+        cc1101WriteReg(CC1101_FSCTRL0, (uint8_t)fsctrl0_val);
+        if (freqMHz < 430.5f) cc1101WriteReg(CC1101_TEST0, 0x0B);
+        else {
+            cc1101WriteReg(CC1101_TEST0, 0x09);
+            uint8_t s = cc1101ReadReg(CC1101_FSCAL2);
+            if (s < 32) cc1101WriteReg(CC1101_FSCAL2, s + 32);
+        }
+    } else if (freqMHz >= 779.0f && freqMHz <= 899.99f) {
+        int fsctrl0_val = (int)(65.0f + (freqMHz - 779.0f) / (899.0f - 779.0f) * (76.0f - 65.0f));
+        cc1101WriteReg(CC1101_FSCTRL0, (uint8_t)fsctrl0_val);
+        if (freqMHz < 861.0f) cc1101WriteReg(CC1101_TEST0, 0x0B);
+        else {
+            cc1101WriteReg(CC1101_TEST0, 0x09);
+            uint8_t s = cc1101ReadReg(CC1101_FSCAL2);
+            if (s < 32) cc1101WriteReg(CC1101_FSCAL2, s + 32);
+        }
+    } else if (freqMHz >= 900.0f && freqMHz <= 928.0f) {
+        int fsctrl0_val = (int)(77.0f + (freqMHz - 900.0f) / (928.0f - 900.0f) * (79.0f - 77.0f));
+        cc1101WriteReg(CC1101_FSCTRL0, (uint8_t)fsctrl0_val);
+        cc1101WriteReg(CC1101_TEST0, 0x09);
+        uint8_t s = cc1101ReadReg(CC1101_FSCAL2);
+        if (s < 32) cc1101WriteReg(CC1101_FSCAL2, s + 32);
+    }
+}
+
+static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
+    float freqMHz = freqHz / 1000000.0f;
+    cc1101SendCommand(CC1101_SIDLE);
+    delay(1);
+    cc1101SetFrequency(freqHz);
+    cc1101CalibrateBand(freqMHz);
+}
+
+// ============================================================
+// Reset e configuração
+// ============================================================
+static bool cc1101Reset() {
+    cs_high();
+    delay(1);
+    cs_low();
+    delay(1);
+    cs_high();
+    delay(1);
+    cs_low();
+    waitMisoReady();
+    SPI.transfer(CC1101_SRES);
+    waitMisoReady();
+    cs_high();
+    delay(1);
+    return true;
+}
+
+static void cc1101ConfigureRegs() {
+    cc1101WriteReg(CC1101_IOCFG2,   0x0E);
+    cc1101WriteReg(CC1101_IOCFG0,   0x0D);
+    cc1101WriteReg(CC1101_PKTCTRL0, 0x32);
+    cc1101WriteReg(CC1101_MDMCFG3,  0x93);
+    cc1101WriteReg(CC1101_MDMCFG2,  0x30);
+    cc1101WriteReg(CC1101_FREND0,   0x11);
+    cc1101WriteReg(CC1101_FSCTRL1,  0x06);
+    cc1101WriteReg(CC1101_MDMCFG4,  0x27);
+    cc1101WriteReg(CC1101_MDMCFG1,  0x02);
+    cc1101WriteReg(CC1101_MDMCFG0,  0xF8);
+    cc1101WriteReg(CC1101_CHANNR,   0x00);
+    cc1101WriteReg(CC1101_DEVIATN,  0x47);
+    cc1101WriteReg(CC1101_FREND1,   0x56);
+    cc1101WriteReg(CC1101_MCSM0,    0x18);
+    cc1101WriteReg(CC1101_FOCCFG,   0x16);
+    cc1101WriteReg(CC1101_BSCFG,    0x1C);
+    cc1101WriteReg(CC1101_AGCCTRL2, 0xC7);
+    cc1101WriteReg(CC1101_AGCCTRL1, 0x00);
+    cc1101WriteReg(CC1101_AGCCTRL0, 0xB2);
+    cc1101WriteReg(CC1101_FSCAL3,   0xE9);
+    cc1101WriteReg(CC1101_FSCAL2,   0x2A);
+    cc1101WriteReg(CC1101_FSCAL1,   0x00);
+    cc1101WriteReg(CC1101_FSCAL0,   0x1F);
+    cc1101WriteReg(CC1101_FSTEST,   0x59);
+    cc1101WriteReg(CC1101_TEST2,    0x81);
+    cc1101WriteReg(CC1101_TEST1,    0x35);
+    cc1101WriteReg(CC1101_TEST0,    0x09);
+    cc1101WriteReg(CC1101_PKTCTRL1, 0x00);   // ADR_CHK = 0
+    cc1101WriteReg(CC1101_ADDR,     0x00);
+    cc1101WriteReg(CC1101_PKTLEN,   0x00);
+    uint8_t paTable[8] = {0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    cc1101WriteRegBurst(CC1101_PATABLE, paTable, 8);
+}
+
+// ============================================================
+// Inicialização
 // ============================================================
 bool cc1101Init() {
-    Serial.println("[CC1101] Inicializando via ELECHOUSE...");
+    Serial.println("[CC1101] Inicializando...");
 
     if (!isr_service_installed) {
         esp_err_t err = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
-        if (err == ESP_OK) {
-            isr_service_installed = true;
-        } else if (err == ESP_ERR_INVALID_STATE) {
-            isr_service_installed = true;
-        }
+        if (err == ESP_OK) isr_service_installed = true;
+        else if (err == ESP_ERR_INVALID_STATE) isr_service_installed = true;
     }
 
-    // Configura os pinos na biblioteca
-    ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
-    ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
+    pinMode(CC1101_CSN, OUTPUT);
+    digitalWrite(CC1101_CSN, HIGH);
+    pinMode(CC1101_GDO0, INPUT);
+    pinMode(CC1101_GDO2, INPUT);
+    delay(10);
 
-    // Verifica comunicação
-    if (!ELECHOUSE_cc1101.getCC1101()) {
-        Serial.println("[CC1101] FAIL: modulo nao detectado");
+    // SPI já foi iniciado no main.cpp (VSPI)
+    cc1101Reset();
+    cc1101ConfigureRegs();
+
+    uint8_t partnum = cc1101ReadStatus(CC1101_PARTNUM);
+    uint8_t version = cc1101ReadStatus(CC1101_VERSION);
+    Serial.printf("[CC1101] PARTNUM=0x%02X VERSION=0x%02X\n", partnum, version);
+    if (partnum == 0xFF || version == 0xFF) {
+        Serial.println("[CC1101] FAIL: modulo nao responde");
         return false;
     }
 
-    // Inicializa com as configurações padrão para captura RAW
-    ELECHOUSE_cc1101.Init();
-    ELECHOUSE_cc1101.setCCMode(0);       // GDO0 = serial clock, GDO2 = serial data
-    ELECHOUSE_cc1101.setModulation(2);   // ASK/OOK
-    ELECHOUSE_cc1101.setMHZ(433.92);     // frequência inicial
-    ELECHOUSE_cc1101.setRxBW(500.0);     // largura de banda de 500 kHz
-    ELECHOUSE_cc1101.setPA(12);          // potência de transmissão máxima
-    ELECHOUSE_cc1101.setSidle();         // estado IDLE
-
     cc1101Initialized = true;
+    cc1101SendCommand(CC1101_SIDLE);
     Serial.println("[CC1101] OK");
     return true;
 }
 
 // ============================================================
-// SLEEP / WAKE
+// Sleep / Wake
 // ============================================================
 void cc1101Sleep() {
     if (!cc1101Initialized) return;
     isr_enabled = false;
-    ELECHOUSE_cc1101.setSidle();
-    ELECHOUSE_cc1101.goSleep();   // Power down (SPWD)
-    Serial.println("[CC1101] Sleep");
+    cc1101SendCommand(CC1101_SIDLE);
+    cc1101SendCommand(CC1101_SPWD);
 }
 
 bool cc1101Wake() {
     if (!cc1101Initialized) return false;
-    // Reinicializa o rádio
-    ELECHOUSE_cc1101.Init();
-    ELECHOUSE_cc1101.setCCMode(0);
-    ELECHOUSE_cc1101.setModulation(2);
-    ELECHOUSE_cc1101.setMHZ(433.92);
-    ELECHOUSE_cc1101.setRxBW(500.0);
-    ELECHOUSE_cc1101.setSidle();
-
+    cc1101Reset();
+    cc1101ConfigureRegs();
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
-    Serial.println("[CC1101] Wake");
     return true;
 }
 
 // ============================================================
-// GoRx (coloca o rádio em RX em uma frequência específica)
+// GoRx com espera ativa por RX
 // ============================================================
 static bool cc1101GoRx(uint32_t freqHz) {
-    float mhz = freqHz / 1000000.0f;
-    ELECHOUSE_cc1101.setMHZ(mhz);
-    ELECHOUSE_cc1101.SetRx();   // SIDLE + calibração + SRX
+    float freqMHz = freqHz / 1000000.0f;
+    cc1101SendCommand(CC1101_SIDLE);
     delay(1);
-    uint8_t marcstate = ELECHOUSE_cc1101.SpiReadStatus(CC1101_MARCSTATE) & 0x1F;
-    int rssi = ELECHOUSE_cc1101.getRssi();
+    cc1101SetFrequency(freqHz);
+    cc1101CalibrateBand(freqMHz);
+    delayMicroseconds(200);
+    cc1101SendCommand(CC1101_SRX);
+
+    unsigned long start = micros();
+    uint8_t marcstate;
+    do {
+        marcstate = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
+        if (marcstate == 0x0D) break;
+        delayMicroseconds(200);
+    } while (micros() - start < 20000);
+
+    uint8_t rssiRaw = cc1101ReadStatus(CC1101_RSSI);
+    int rssiDbm = (rssiRaw >= 128) ? ((int)rssiRaw - 256) / 2 - 74 : (int)rssiRaw / 2 - 74;
     Serial.printf("[CC1101] GoRx %lu Hz | MARCSTATE=0x%02X RSSI=%d GDO0=%d GDO2=%d\n",
-        freqHz, marcstate, rssi, digitalRead(CC1101_GDO0), digitalRead(CC1101_GDO2));
+        freqHz, marcstate, rssiDbm, digitalRead(CC1101_GDO0), digitalRead(CC1101_GDO2));
     return true;
 }
 
 // ============================================================
-// CAPTURA RAW (hopping + ISR)
+// Captura RAW
 // ============================================================
 void cc1101StartCapture() {
     if (!cc1101Initialized) return;
-    if (!cc1101Wake()) {
-        Serial.println("[CC1101] CAPTURE: falha ao acordar!");
-        return;
-    }
+    if (!cc1101Wake()) return;
     cc1101CopyActive = true;
     currentCapture.count = 0;
     currentCapture.startTime = millis();
@@ -198,10 +400,6 @@ void cc1101StartCapture() {
     isr_last_val = digitalRead(CC1101_GDO2);
     isr_last_change = micros();
     isr_enabled = true;
-
-    Serial.printf("[CC1101] Capture @ %lu Hz (ISR=%s)\n",
-        currentCapture.frequency,
-        isr_service_installed ? "OK" : "NAO INSTALADO!");
 }
 
 void cc1101CaptureLoop() {
@@ -212,8 +410,7 @@ void cc1101CaptureLoop() {
     if (capture_state == STATE_HOPPING) {
         if (isr_count > 5) {
             capture_state = STATE_LOCKED;
-            Serial.printf("[CC1101] LOCKED freq=%luM, pulses=%d\n",
-                currentCapture.frequency / 1000000, isr_count);
+            Serial.printf("[CC1101] LOCKED freq=%luM, pulses=%d\n", currentCapture.frequency / 1000000, isr_count);
         }
         else if (nowMs - lastFreqSwitch > 1000) {
             if (isr_count == 0 && !capture_started) {
@@ -266,7 +463,7 @@ void cc1101CaptureLoop() {
             isr_enabled = false;
             currentCapture.active = false;
             cc1101CopyActive = false;
-            ELECHOUSE_cc1101.setSidle();
+            cc1101SendCommand(CC1101_SIDLE);
             if (isr_count > 20 && savedSignalCount < MAX_SAVED_SIGNALS) {
                 SignalData* sig = &savedSignals[savedSignalCount];
                 sig->length = isr_count;
@@ -315,7 +512,7 @@ void cc1101StopCapture() {
     isr_enabled = false;
     cc1101CopyActive = false;
     currentCapture.active = false;
-    ELECHOUSE_cc1101.setSidle();
+    cc1101SendCommand(CC1101_SIDLE);
 }
 
 uint8_t cc1101GetPulseCount() { return isr_count; }
@@ -323,7 +520,7 @@ uint32_t cc1101GetCurrentFreq() { return currentCapture.frequency / 1000000; }
 uint8_t cc1101GetPinState() { return digitalRead(CC1101_GDO0); }
 
 // ============================================================
-// REPLAY (TX)
+// Replay (TX)
 // ============================================================
 void cc1101ReplaySignal(uint8_t index) {
     if (index >= savedSignalCount || !savedSignals[index].valid) return;
@@ -331,10 +528,10 @@ void cc1101ReplaySignal(uint8_t index) {
     if (!cc1101Wake()) return;
     isr_enabled = false;
     SignalData* sig = &savedSignals[index];
-    ELECHOUSE_cc1101.setMHZ(sig->frequency / 1000000.0f);
-    ELECHOUSE_cc1101.setSidle();
-    delay(1);
-    ELECHOUSE_cc1101.SetTx();
+    cc1101SetFrequencyCalibrated(sig->frequency);
+    cc1101WriteReg(CC1101_IOCFG0, 0x2E);   // GDO0 como saída digital
+    cc1101SendCommand(CC1101_SIDLE); delay(1);
+    cc1101SendCommand(CC1101_STX); delay(1);
     pinMode(CC1101_GDO0, OUTPUT);
     digitalWrite(CC1101_GDO0, LOW);
     for (int i = 0; i < sig->length; i++) {
@@ -343,21 +540,22 @@ void cc1101ReplaySignal(uint8_t index) {
     }
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT_PULLUP);
-    ELECHOUSE_cc1101.setSidle();
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
+    cc1101SendCommand(CC1101_SIDLE);
     cc1101Sleep();
 }
 
 // ============================================================
-// BRUTE FORCE (simplificado, mantém compatibilidade)
+// Brute Force (mantido para compatibilidade)
 // ============================================================
 void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
     if (!cc1101Initialized) return;
     if (!cc1101Wake()) return;
     isr_enabled = false;
-    ELECHOUSE_cc1101.setMHZ(freq / 1000000.0f);
-    ELECHOUSE_cc1101.setSidle();
-    delay(1);
-    ELECHOUSE_cc1101.SetTx();
+    cc1101SetFrequencyCalibrated(freq);
+    cc1101WriteReg(CC1101_IOCFG0, 0x2E);
+    cc1101SendCommand(CC1101_SIDLE); delay(1);
+    cc1101SendCommand(CC1101_STX); delay(1);
     pinMode(CC1101_GDO0, OUTPUT);
     digitalWrite(CC1101_GDO0, LOW);
     for (int rep = 0; rep < 3; rep++) {
@@ -380,21 +578,22 @@ void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
     }
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT_PULLUP);
-    ELECHOUSE_cc1101.setSidle();
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
+    cc1101SendCommand(CC1101_SIDLE);
     cc1101Sleep();
 }
 
 // ============================================================
-// JAMMER
+// Jammer
 // ============================================================
 void cc1101StartSubGHzJammer() {
     if (!cc1101Initialized) return;
     if (!cc1101Wake()) return;
     isr_enabled = false;
-    ELECHOUSE_cc1101.setMHZ(433.92);
-    ELECHOUSE_cc1101.setSidle();
-    delay(1);
-    ELECHOUSE_cc1101.SetTx();
+    cc1101SetFrequencyCalibrated(433920000);
+    cc1101WriteReg(CC1101_IOCFG0, 0x2E);
+    cc1101SendCommand(CC1101_SIDLE); delay(1);
+    cc1101SendCommand(CC1101_STX); delay(1);
     pinMode(CC1101_GDO0, OUTPUT);
     digitalWrite(CC1101_GDO0, HIGH);
     cc1101JammerActive = true;
@@ -404,13 +603,14 @@ void cc1101StopSubGHzJammer() {
     if (!cc1101Initialized) return;
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT_PULLUP);
-    ELECHOUSE_cc1101.setSidle();
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
+    cc1101SendCommand(CC1101_SIDLE);
     cc1101Sleep();
     cc1101JammerActive = false;
 }
 
 // ============================================================
-// ROLLJAM
+// RollJam
 // ============================================================
 void cc1101StartRollJam() {
     if (!cc1101Initialized) return;
@@ -420,9 +620,11 @@ void cc1101StartRollJam() {
     rj_timer = millis();
     currentCapture.frequency = 433920000;
     isr_enabled = false;
-    ELECHOUSE_cc1101.setMHZ(433.92);
-    ELECHOUSE_cc1101.SetRx();
+    cc1101SetFrequencyCalibrated(currentCapture.frequency);
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
     pinMode(CC1101_GDO0, INPUT);
+    cc1101SendCommand(CC1101_SIDLE); delay(1);
+    cc1101SendCommand(CC1101_SRX);
     delay(5);
 }
 
@@ -444,9 +646,9 @@ void cc1101RollJamLoop() {
     else if (rj_state == 1) {
         if (now - rj_timer > 200) {
             isr_enabled = false;
-            ELECHOUSE_cc1101.setSidle();
-            delay(1);
-            ELECHOUSE_cc1101.SetTx();
+            cc1101WriteReg(CC1101_IOCFG0, 0x2E);
+            cc1101SendCommand(CC1101_SIDLE); delay(1);
+            cc1101SendCommand(CC1101_STX);
             pinMode(CC1101_GDO0, OUTPUT);
             digitalWrite(CC1101_GDO0, HIGH);
             rj_state = 2;
@@ -457,7 +659,7 @@ void cc1101RollJamLoop() {
         if (now - rj_timer > 200) {
             digitalWrite(CC1101_GDO0, LOW);
             pinMode(CC1101_GDO0, INPUT);
-            ELECHOUSE_cc1101.setSidle();
+            cc1101SendCommand(CC1101_SIDLE);
             if (isr_count > 20 && savedSignalCount < MAX_SAVED_SIGNALS) {
                 SignalData* sig = &savedSignals[savedSignalCount];
                 sig->length = isr_count;
@@ -479,12 +681,13 @@ void cc1101StopRollJam() {
     isr_enabled = false;
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT);
-    ELECHOUSE_cc1101.setSidle();
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
+    cc1101SendCommand(CC1101_SIDLE);
     cc1101Sleep();
 }
 
 // ============================================================
-// ANALISADOR DE ESPECTRO
+// Analisador de Espectro
 // ============================================================
 void cc1101StartAnalyzer() {
     if (!cc1101Initialized) return;
@@ -495,8 +698,8 @@ void cc1101StartAnalyzer() {
     for(int i=0; i<16; i++) spec_an_freqs[15+i] = 387000000 + (i * 4800000);
     for(int i=0; i<33; i++) spec_an_freqs[31+i] = 779000000 + (i * 4500000);
     for(int i=0; i<64; i++) spec_an_values[i] = 0;
-    ELECHOUSE_cc1101.setMHZ(spec_an_freqs[0] / 1000000.0f);
-    ELECHOUSE_cc1101.SetRx();
+    cc1101SetFrequencyCalibrated(spec_an_freqs[0]);
+    cc1101SendCommand(CC1101_SRX);
 }
 
 void cc1101AnalyzerLoop() {
@@ -505,42 +708,39 @@ void cc1101AnalyzerLoop() {
         if (spec_an_values[i] > 0) spec_an_values[i]--;
     }
     uint32_t freq = spec_an_freqs[spec_an_idx];
-    ELECHOUSE_cc1101.setMHZ(freq / 1000000.0f);
-    ELECHOUSE_cc1101.SetRx();
+    cc1101SetFrequencyCalibrated(freq);
+    cc1101SendCommand(CC1101_SIDLE); delay(1);
+    cc1101SendCommand(CC1101_SRX);
     delayMicroseconds(300);
-    int rssi = ELECHOUSE_cc1101.getRssi();
+    uint8_t rssiDec = cc1101ReadStatus(CC1101_RSSI);
+    int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
     if (rssi < -90) rssi = -90;
     if (rssi > -50) rssi = -50;
     uint16_t target_h = map(rssi, -90, -50, 0, 40);
-    if (target_h > spec_an_values[spec_an_idx]) {
-        spec_an_values[spec_an_idx] = target_h;
-    }
+    if (target_h > spec_an_values[spec_an_idx]) spec_an_values[spec_an_idx] = target_h;
     spec_an_idx++;
     if (spec_an_idx >= 64) spec_an_idx = 0;
 }
 
 void cc1101StopAnalyzer() {
     spec_an_running = false;
-    ELECHOUSE_cc1101.setSidle();
+    cc1101SendCommand(CC1101_SIDLE);
     cc1101Sleep();
 }
 
 bool cc1101AnalyzerIsRunning() { return spec_an_running; }
-
 uint16_t cc1101GetAnalyzerValue(int idx) {
     if (idx < 0 || idx >= 64) return 0;
     return spec_an_values[idx];
 }
-
 uint32_t cc1101GetAnalyzerFreq(int idx) {
     if (idx < 0 || idx >= 64) return 0;
     return spec_an_freqs[idx] / 1000000;
 }
-
 uint8_t cc1101GetAnalyzerSelected() { return spec_an_idx; }
 
 // ============================================================
-// GERENCIAMENTO DE SINAIS SALVOS
+// Gerenciamento de sinais salvos
 // ============================================================
 void cc1101ClearSavedSignals() {
     savedSignalCount = 0;
@@ -557,16 +757,16 @@ void cc1101DeleteSignal(uint8_t index) {
 }
 
 // ============================================================
-// TRANSMISSÃO RAW (para Termux etc.)
+// Transmissão RAW
 // ============================================================
 void cc1101TransmitRaw(uint32_t frequency, uint16_t* timings, uint8_t length) {
     if (!cc1101Initialized || length == 0 || length > 200) return;
     if (!cc1101Wake()) return;
     isr_enabled = false;
-    ELECHOUSE_cc1101.setMHZ(frequency / 1000000.0f);
-    ELECHOUSE_cc1101.setSidle();
-    delay(1);
-    ELECHOUSE_cc1101.SetTx();
+    cc1101SetFrequencyCalibrated(frequency);
+    cc1101WriteReg(CC1101_IOCFG0, 0x2E);
+    cc1101SendCommand(CC1101_SIDLE); delay(1);
+    cc1101SendCommand(CC1101_STX); delay(1);
     pinMode(CC1101_GDO0, OUTPUT);
     digitalWrite(CC1101_GDO0, LOW);
     for (int i = 0; i < length; i++) {
@@ -575,24 +775,24 @@ void cc1101TransmitRaw(uint32_t frequency, uint16_t* timings, uint8_t length) {
     }
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT_PULLUP);
-    ELECHOUSE_cc1101.setSidle();
+    cc1101WriteReg(CC1101_IOCFG0, 0x0D);
+    cc1101SendCommand(CC1101_SIDLE);
     cc1101Sleep();
 }
 
 // ============================================================
-// STATUS
+// Status e acesso
 // ============================================================
 bool cc1101IsAvailable() { return cc1101Initialized; }
 bool cc1101IsCapturing() { return cc1101CopyActive; }
 uint8_t cc1101GetSavedCount() { return savedSignalCount; }
-
 SignalData* cc1101GetSignal(uint8_t index) {
     if (index < savedSignalCount) return &savedSignals[index];
     return nullptr;
 }
 
 // ============================================================
-// DRONE RSSI (para localização)
+// Drone RSSI
 // ============================================================
 int8_t cc1101GetDroneRSSI() {
     if (!cc1101Initialized) return 0;
@@ -600,18 +800,20 @@ int8_t cc1101GetDroneRSSI() {
     int maxRssiDbm = -100;
     int persistentHits = 0;
     for(int freq=0; freq<2; freq++) {
-        float mhz = (freq==0) ? 868.0 : 915.0;
-        ELECHOUSE_cc1101.setMHZ(mhz);
-        ELECHOUSE_cc1101.SetRx();
+        cc1101SendCommand(CC1101_SIDLE);
+        if(freq==0) cc1101SetFrequencyCalibrated(868000000);
+        else cc1101SetFrequencyCalibrated(915000000);
+        cc1101SendCommand(CC1101_SRX);
         delayMicroseconds(500);
         for(int i=0; i<3; i++) {
-            int rssi = ELECHOUSE_cc1101.getRssi();
+            uint8_t rssiDec = cc1101ReadStatus(CC1101_RSSI);
+            int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
             if (rssi > maxRssiDbm) maxRssiDbm = rssi;
             if (rssi > -75) persistentHits++;
             delay(5);
         }
     }
-    ELECHOUSE_cc1101.setSidle();
+    cc1101SendCommand(CC1101_SIDLE);
     cc1101Sleep();
     if (persistentHits < 2) return 0;
     if (maxRssiDbm < -70) return 0;
