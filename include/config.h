@@ -20,12 +20,12 @@
 #define NRF_MOSI    23
 #define NRF_MISO    19
 
-#define CC1101_GDO0 17
+#define CC1101_GDO0 16
 #define CC1101_CSN  15
 #define CC1101_SCK  14
 #define CC1101_MOSI 13
 #define CC1101_MISO 12
-#define CC1101_GDO2 16
+#define CC1101_GDO2 17
 
 #define BUZZER_PIN  4
 
@@ -212,12 +212,8 @@ extern void cc1101WriteReg(uint8_t reg, uint8_t value);
 extern void cc1101SendCommand(uint8_t cmd);
 
 // ============================================================
-// SLEEP / WAKE — Isolamento de módulos
-// Modulos dormem após init e só acordam sob demanda
+// NRF24 - expostos para menu.cpp (powerDown ao sair do menu)
 // ============================================================
 extern void nrf24Sleep();
-extern void nrf24Wake();
-extern void cc1101Sleep();
-extern bool cc1101Wake();
 
 #endif
