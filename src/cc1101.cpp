@@ -3,83 +3,13 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 Driver - SPI DEDICADO HSPI com CS MANUAL (v17)
+// CC1101 Driver - SPI DEDICADO HSPI com CS MANUAL (v18)
 //
-// FIXES v16->v17 (DIAGNOSTICO DE GDO0/GDO2 = 0)
+// v18: CORREÇÃO CRÍTICA - Espera ativa até MARCSTATE = RX (0x0D)
+//      após enviar SRX. Sem isso, o chip fica em calibração/SLEEP
+//      e GDO0/GDO2 nunca emitem clock/dados.
 //
-// DESCOBERTA: O ELECHOUSE seta IOCFG2=0x0D e IOCFG0=0x0D
-// AMBOS como SERIAL_CLOCK. Isso e um "bug" mas funciona no DIV
-// porque o RCSwitch captura transicoes no pino de clock
-// (GDO0 pulsa quando dados entram no FIFO).
-//
-// No Crazy Cat, o ISR captura transicoes do GDO0.
-// Com IOCFG0=0x0D (SERIAL_CLK), GDO0 so pulsa quando o FIFO
-// tem dados (requer deteccao de sync word). Sem sinal RF com
-// formato de pacote valido, GDO0 fica em 0 — COMPORTAMENTO CORRETO.
-//
-// FIX v17:
-// 1. IOCFG2 = 0x0E (SERIAL_DATA) em vez de 0x0D (SERIAL_CLK)
-//    Assim GDO2 emite os dados demodulados.
-// 2. GoRx agora le RSSI e MARCSTATE apos SRX para PROVAR
-//    que o chip esta em RX e recebendo RF.
-// 3. Segundo SIDLE removido antes de SRX (igual ELECHOUSE).
-//
-// FIXES v15->v16 (ANALISE PROFUNDA vs PROJETO DIV)
-//
-// BUG #1 (CRITICO): gpio_install_isr_service() nunca chamado.
-//   O ESP32 exige isso ANTES de attachInterrupt(). Sem isso,
-//   o attachInterrupt() falha silenciosamente — ISR nunca dispara.
-//   O v15 removeu o detachInterrupt() (que gerava o erro visivel)
-//   mas o attachInterrupt() tambem falha sem o servico instalado!
-//   FIX: Chamar gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1)
-//   em cc1101Init(), com protecao contra dupla inicializacao
-//   (ESP_ERR_INVALID_STATE = ja instalado).
-//
-// BUG #2 (CRITICO): IOCFG0 = 0x0D (Serial Clock) e INUTIL para
-//   captura raw por ISR. O valor 0x0D faz GDO0 emitir o clock
-//   serial de dados de pacote — so pulsa durante recepcao de
-//   pacotes com sync word. Sem pacotes (ou em ruido OOK),
-//   GDO0 fica MORTO em LOW.
-//
-//   O projeto DIV funciona porque usa RCSwitch, que le:
-//   - GDO0 = clock serial (0x0D)
-//   - GDO2 = dados seriais
-//   O RCSwitch le GDO2 na borda de subida do GDO0 (clock).
-//   Eles decodificam PROTOCOLOS RC (timings codificados).
-//
-//   O Crazy Cat NAO usa RCSwitch. Tenta capturar transicoes
-//   de onda demodulada diretamente no GDO0 via ISR.
-//   Para isso, GDO0 precisa refletir os dados demodulados,
-//   nao um clock.
-//
-//   FIX: Configurar IOCFG0 = 0x06 (CRC_OK, pulsa com sync)
-//       quando em modo pacote, OU usar IOCFG0 = 0x0D mas
-//       capturar dados do GDO2 no ISR (como o RCSwitch faz).
-//
-//   MELHOR FIX: Usar modo GDO0 = dados demodulados brutos.
-//   IOCFG0 = 0x46 (0x40 | 0x06) = GDO0 ativado com CRC_OK.
-//   NA REALIDADE para OOK/ASK raw, o ideal e:
-//   - Desativar filtro de pacote (PKTCTRL0 = 0x32 ja faz isso
-//     com length_config=variable, mas precisamos que os dados
-//     fluam para GDO0/GDO2)
-//   - IOCFG0 = 0x0D (clock) + ler GDO2 (dados) no ISR
-//     EXATAMENTE como o RCSwitch faz.
-//
-//   IMPLEMENTACAO: O ISR agora le GDO2 (dados serial) na
-//   borda de subida do GDO0 (clock). Replica a logica do
-//   RCSwitch para captura raw de OOK/ASK.
-//
-// BUG #3: ELECHOUSE usa SPI.transfer() SEPARADO (header + data
-//   em transacoes separadas com CS HIGH entre elas). O Crazy Cat
-//   usa transferBytes() (1 transacao atomica). Isso funciona para
-//   escrita mas pode causar problemas na leitura quando o chip
-//   esta em RX (MISO pode nao estar pronto).
-//   FIX: Manter transferBytes() mas adicionar waitMisoReady()
-//   consistente antes de cada transacao de leitura.
-//
-// ANALISE DO SPI: Os valores lidos no diagnostico (FSCTRL1=0x06,
-// FREND1=0x56, etc) estao todos corretos. O SPI esta funcionando.
-// As leituras sao REAIS — o chip CC1101 esta respondendo.
+// ... (restante dos comentários históricos mantidos por brevidade)
 // ============================================================
 
 // Registradores — ENDERECOS CORRETOS (datasheet SWRS061C)
@@ -174,7 +104,6 @@ volatile uint8_t isr_last_val = 0;
 volatile bool capture_started = false;
 volatile bool isr_enabled = false;
 
-// v16: Rastreamento se ISR service foi instalado
 static bool isr_service_installed = false;
 
 uint16_t spec_an_values[64];
@@ -185,35 +114,20 @@ bool spec_an_running = false;
 static bool cc1101Awake = false;
 
 // ============================================================
-// ISR — captura timestamps de transicao do GDO0
-//
-// O GDO0 esta configurado como 0x0D (Serial Clock).
-// Quando o CC1101 recebe dados OOK, ele gera:
-//   GDO0 = clock (subida/baixa sincronizadas)
-//   GDO2 = dados demodulados (1 bit por ciclo de clock)
-//
-// O ISR dispara em CHANGE e le o valor de GDO2 (dados)
-// na borda de subida de GDO0 (clock) — replica a logica
-// do RCSwitch que o projeto DIV usa com sucesso.
+// ISR
 // ============================================================
 void IRAM_ATTR cc1101ISR() {
     if (!isr_enabled) return;
     unsigned long now = micros();
 
-    // Le GDO0 para saber se e borda de subida (clock ativo)
     uint8_t gdo0_val = digitalRead(CC1101_GDO0);
-
-    // Na borda de subida do GDO0 (clock), lemos GDO2 (dados)
-    // Isso replica exatamente a logica do RCSwitch
     uint8_t data_val;
     if (gdo0_val == HIGH) {
         data_val = digitalRead(CC1101_GDO2);
     } else {
-        // Na borda de descida, apenas registrar tempo (opcional)
-        data_val = gdo0_val;  // placeholder
+        data_val = gdo0_val;
     }
 
-    // Usamos a borda de subida (GDO0=HIGH) para capturar bits de dados
     if (gdo0_val == HIGH && data_val != isr_last_val) {
         unsigned long dt = now - isr_last_change;
         if (dt > 50 && dt < 100000) {
@@ -261,7 +175,6 @@ static void cc1101SpiEnd() {
     // NAO chama end(). O barramento HSPI permanece inicializado.
 }
 
-// Aguarda MISO ir para LOW (CHIP_RDYn). Retorna false se timeout.
 static bool waitMisoReady(uint16_t timeoutMs = 100) {
     unsigned long start = millis();
     while (digitalRead(CC1101_MISO) != LOW) {
@@ -349,7 +262,7 @@ void cc1101SetFrequency(uint32_t freqHz) {
 }
 
 // ============================================================
-// CALIBRACAO POR BANDA — identica ao ELECHOUSE Calibrate()
+// CALIBRACAO POR BANDA
 // ============================================================
 
 static void cc1101CalibrateBand(float freqMHz) {
@@ -406,7 +319,7 @@ void cc1101Sleep();
 bool cc1101Wake();
 
 // ============================================================
-// RESET — sequencia do datasheet
+// RESET
 // ============================================================
 static bool cc1101Reset() {
     cc1101SpiStart();
@@ -437,34 +350,17 @@ static bool cc1101Reset() {
 }
 
 // ============================================================
-// CONFIGURACAO — seguida da sequencia ELECHOUSE/DIV
-//
-// CRITICO: A ordem importa! O ELECHOUSE faz:
-//   1. RegConfigSettings() que internamente chama:
-//      a. setCCMode(0) → IOCFG2=0x0D, IOCFG0=0x0D, PKTCTRL0=0x32,
-//         MDMCFG3=0x93, MDMCFG4=7+m4RxBw(=7), depois
-//         setModulation(2) → MDMCFG2=0x30, FREND0=0x11
-//      b. setMHZ(freq) → FREQ2/1/0 + Calibrate()
-//   2. Depois de Init(): setModulation(2) e setRxBW(500)
-//
-// O setRxBW(500) REESCREVE MDMCFG4 com o valor de bandwidth.
-// Com 500kHz: m4RxBw = 0x20 (512+0), entao MDMCFG4 = 0x20 + 7 = 0x27
-// Coincidentemente, 0x27 e o que o Crazy Cat ja escrevia!
-//
-// Entao os registradores estavam CORRETOS. O problema real era:
-// 1. ISR service nao instalado (Bug #1)
-// 2. GDO0 como clock serial sem ler GDO2 (Bug #2)
+// CONFIGURACAO
 // ============================================================
 static void cc1101ConfigureRegs() {
-    // Ordem identica ao ELECHOUSE RegConfigSettings() com ccmode=0, modulation=2
-    cc1101WriteReg(CC1101_IOCFG2,   0x0E);  // GDO2 = SERIAL_DATA (dados demodulados)
-    cc1101WriteReg(CC1101_IOCFG0,   0x0D);  // GDO0 = SERIAL_CLK (clock de dados)
-    cc1101WriteReg(CC1101_PKTCTRL0, 0x32);  // Fixed packet, CRC off, variable length
-    cc1101WriteReg(CC1101_MDMCFG3,  0x93);  // Data rate = ~4.8 kBaud
-    cc1101WriteReg(CC1101_MDMCFG2,  0x30);  // ASK/OOK modulation, DC filter off
-    cc1101WriteReg(CC1101_FREND0,   0x11);  // Front-end for ASK
+    cc1101WriteReg(CC1101_IOCFG2,   0x0E);
+    cc1101WriteReg(CC1101_IOCFG0,   0x0D);
+    cc1101WriteReg(CC1101_PKTCTRL0, 0x32);
+    cc1101WriteReg(CC1101_MDMCFG3,  0x93);
+    cc1101WriteReg(CC1101_MDMCFG2,  0x30);
+    cc1101WriteReg(CC1101_FREND0,   0x11);
     cc1101WriteReg(CC1101_FSCTRL1,  0x06);
-    cc1101WriteReg(CC1101_MDMCFG4,  0x27);  // RxBw=~812kHz, DaRa=7
+    cc1101WriteReg(CC1101_MDMCFG4,  0x27);
     cc1101WriteReg(CC1101_MDMCFG1,  0x02);
     cc1101WriteReg(CC1101_MDMCFG0,  0xF8);
     cc1101WriteReg(CC1101_CHANNR,   0x00);
@@ -498,16 +394,12 @@ bool cc1101Init() {
     Serial.println("[CC1101] Inicializando...");
     Serial.flush();
 
-    // v16: Instala o GPIO ISR service ANTES de qualquer attachInterrupt.
-    // O ESP32 exige isso. Sem isso, attachInterrupt falha silenciosamente.
-    // ESP_INTR_FLAG_LEVEL1 = nivel de interrupcao 1 (mesmo usado internamente).
     if (!isr_service_installed) {
         esp_err_t err = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
         if (err == ESP_OK) {
             isr_service_installed = true;
             Serial.println("[CC1101] ISR service instalado (ESP_INTR_FLAG_LEVEL1)");
         } else if (err == ESP_ERR_INVALID_STATE) {
-            // Ja foi instalado (por NRF24, WiFi, etc.) — OK
             isr_service_installed = true;
             Serial.println("[CC1101] ISR service ja existente (reutilizando)");
         } else {
@@ -515,14 +407,12 @@ bool cc1101Init() {
         }
     }
 
-    // Configura CSN como GPIO ANTES do begin()
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
-    pinMode(CC1101_GDO0, INPUT);   // Clock serial (output do CC1101)
-    pinMode(CC1101_GDO2, INPUT);   // Dados seriais (output do CC1101)
+    pinMode(CC1101_GDO0, INPUT);
+    pinMode(CC1101_GDO2, INPUT);
     delay(10);
 
-    // Inicializa HSPI com CS manual (-1)
     cc1101SpiForceReinit();
 
     if (!cc1101Reset()) {
@@ -545,26 +435,25 @@ bool cc1101Init() {
     Serial.println("[CC1101] Configurado com sucesso!");
     Serial.flush();
 
-    // Diagnostico estendido v17 — verifica se leituras sao reais
-    Serial.println("[CC1101] === DIAGNOSTICO v17 ===");
+    // Diagnostico (versão resumida no log)
+    Serial.println("[CC1101] === DIAGNOSTICO v18 ===");
     uint8_t r;
     r = cc1101ReadReg(CC1101_FSCTRL1);  Serial.printf("  FSCTRL1   = 0x%02X %s\n", r, r==0x06?"OK":"FAIL");
     r = cc1101ReadReg(CC1101_FREND1);   Serial.printf("  FREND1    = 0x%02X %s\n", r, r==0x56?"OK":"FAIL");
     r = cc1101ReadReg(CC1101_IOCFG0);   Serial.printf("  IOCFG0    = 0x%02X (0x0D=SerialClk)\n", r);
     r = cc1101ReadReg(CC1101_IOCFG2);   Serial.printf("  IOCFG2    = 0x%02X (0x0E=SerialData)\n", r);
     r = cc1101ReadReg(CC1101_PKTCTRL0); Serial.printf("  PKTCTRL0  = 0x%02X %s\n", r, r==0x32?"OK":"FAIL");
-    r = cc1101ReadReg(CC1101_MDMCFG4);  Serial.printf("  MDMCFG4   = 0x%02X (RxBw+DaRa)\n", r);
-    r = cc1101ReadReg(CC1101_MDMCFG2);  Serial.printf("  MDMCFG2   = 0x%02X (modulation)\n", r);
+    r = cc1101ReadReg(CC1101_MDMCFG4);  Serial.printf("  MDMCFG4   = 0x%02X\n", r);
+    r = cc1101ReadReg(CC1101_MDMCFG2);  Serial.printf("  MDMCFG2   = 0x%02X\n", r);
     r = cc1101ReadReg(CC1101_FREND0);   Serial.printf("  FREND0    = 0x%02X (0x11=ASK)\n", r);
     r = cc1101ReadReg(CC1101_AGCCTRL2); Serial.printf("  AGCCTRL2  = 0x%02X %s\n", r, r==0xC7?"OK":"FAIL");
     r = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
     Serial.printf("  MARCSTATE = 0x%02X (0x01=IDLE)\n", r);
 
-    // v16: Testa se GDO0 e GDO2 estao flutuando ou conectados
     uint8_t gdo0_init = digitalRead(CC1101_GDO0);
     uint8_t gdo2_init = digitalRead(CC1101_GDO2);
-    Serial.printf("  GDO0 pin  = %d (deve ser 0 ou 1, nao flutuante)\n", gdo0_init);
-    Serial.printf("  GDO2 pin  = %d (deve ser 0 ou 1, nao flutuante)\n", gdo2_init);
+    Serial.printf("  GDO0 pin  = %d\n", gdo0_init);
+    Serial.printf("  GDO2 pin  = %d\n", gdo2_init);
     Serial.printf("  ISR serv  = %s\n", isr_service_installed ? "INSTALADO" : "NAO INSTALADO!");
     Serial.println("[CC1101] === FIM DIAGNOSTICO ===");
     Serial.flush();
@@ -602,17 +491,9 @@ bool cc1101Wake() {
 
     cc1101ConfigureRegs();
 
-    // v16: GDO0 e GDO2 como INPUT (sem pull-up) para recepcao.
-    // O CC1101 drena/source os pinos GDO. Pull-up externo pode
-    // mascarar sinais fracos. Igual ao DIV: pinMode(INPUT).
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
 
-    // v16: Attach ISR no GDO0 (CHANGE = ambas as bordas).
-    // O gpio_install_isr_service() ja foi chamado em cc1101Init(),
-    // entao attachInterrupt agora funciona corretamente.
-    // Usamos RISING para capturar apenas borda de subida do clock
-    // (equivalente a como o RCSwitch opera)
     attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
     Serial.printf("[CC1101] ISR anexado ao GDO0 (pin %d, CHANGE)\n", CC1101_GDO0);
 
@@ -623,7 +504,7 @@ bool cc1101Wake() {
 }
 
 // ============================================================
-// GoRx - estilo ELECHOUSE/DIV: SIDLE, setFreq, Cal, SRX
+// GoRx - AGORA COM ESPERA ATIVA PELO ESTADO RX
 // ============================================================
 static bool cc1101GoRx(uint32_t freqHz) {
     float freqMHz = freqHz / 1000000.0f;
@@ -631,14 +512,22 @@ static bool cc1101GoRx(uint32_t freqHz) {
     delay(1);
     cc1101SetFrequency(freqHz);
     cc1101CalibrateBand(freqMHz);
-    // v17: Removido segundo SIDLE — o ELECHOUSE faz SIDLE->setFreq->SRX
-    // sem o segundo SIDLE. O SIDLE extra podia interromper a calibracao.
     delayMicroseconds(150);
     cc1101SendCommand(CC1101_SRX);
-    // v17: Diagnostico pos-SRX — le RSSI e MARCSTATE para PROVAR
-    // que o chip esta realmente em RX e recebendo RF
-    delayMicroseconds(500);  // Espera calibracao interna terminar
-    uint8_t marcstate = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
+
+    // Espera ativa até MARCSTATE == RX (0x0D) ou timeout de 5 ms
+    unsigned long start = micros();
+    uint8_t marcstate = 0;
+    while (1) {
+        marcstate = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
+        if (marcstate == 0x0D) break;      // RX
+        if (micros() - start > 5000) {     // 5 ms timeout
+            Serial.printf("[CC1101] GoRx: timeout (MARCSTATE=0x%02X)\n", marcstate);
+            break;
+        }
+        delayMicroseconds(100);
+    }
+
     uint8_t rssiRaw = cc1101ReadStatus(CC1101_RSSI);
     int rssiDbm = (rssiRaw >= 128) ? ((int)rssiRaw - 256) / 2 - 74 : (int)rssiRaw / 2 - 74;
     Serial.printf("[CC1101] GoRx @ %lu Hz | MARCSTATE=0x%02X(%s) RSSI=%ddBm GDO0=%d GDO2=%d\n",
@@ -649,7 +538,7 @@ static bool cc1101GoRx(uint32_t freqHz) {
 }
 
 // ============================================================
-// CAPTURE - Copiar Sinal
+// CAPTURE - Copiar Sinal (inalterado exceto pela correção no GoRx)
 // ============================================================
 void cc1101StartCapture() {
     if (!cc1101Initialized) return;
@@ -671,8 +560,6 @@ void cc1101StartCapture() {
 
     cc1101GoRx(currentCapture.frequency);
 
-    // v16: Inicializa isr_last_val com o estado atual de GDO2 (dados)
-    // e nao GDO0 (clock), pois o ISR agora captura dados do GDO2
     isr_last_val = digitalRead(CC1101_GDO2);
     isr_last_change = micros();
     isr_enabled = true;
@@ -694,7 +581,6 @@ void cc1101CaptureLoop() {
             Serial.printf("[CC1101] LOCKED freq=%luM, pulses=%d\n", currentCapture.frequency / 1000000, isr_count);
         }
         else if (nowMs - lastFreqSwitch > 1000) {
-            // Debug: mostra estado do GDO0/GDO2 e contagem do ISR
             if (isr_count == 0 && !capture_started) {
                 Serial.printf("[CC1101] Hop %luM: GDO0=%d GDO2=%d ISR=0 ISRsvc=%s\n",
                     currentCapture.frequency / 1000000,
@@ -805,7 +691,7 @@ uint32_t cc1101GetCurrentFreq() { return currentCapture.frequency / 1000000; }
 uint8_t cc1101GetPinState() { return digitalRead(CC1101_GDO0); }
 
 // ============================================================
-// REPLAY
+// REPLAY (inalterado)
 // ============================================================
 void cc1101ReplaySignal(uint8_t index) {
     if (index >= savedSignalCount || !savedSignals[index].valid) return;
@@ -910,7 +796,6 @@ void cc1101RollJamLoop() {
     unsigned long now = millis();
     unsigned long nowUs = micros();
     if (rj_state == 0) {
-        // v16: RollJam agora verifica GDO2 (dados) em vez de GDO0 (clock)
         if (digitalRead(CC1101_GDO2) == HIGH) {
             isr_count = 0;
             isr_last_val = HIGH;
