@@ -3,26 +3,10 @@
 #include "config.h"
 
 // ============================================================
-// NRF24 Driver — SPI DEDICADO VSPI (v14 — fix completo)
-//
-// PROBLEMA ANTERIOR:
-//   - Usava o objeto global SPI (que no ESP32 Arduino v2.0.x
-//     mapeia para HSPI — MESMO periférico que o CC1101!)
-//   - SPI.begin() destruía a configuração do HSPI do CC1101
-//   - radio.begin() chamava SPI.begin() sem argumentos, resetando pinos
-//
-// FIX:
-//   - SPIClass nrf24SPI(VSPI) = SPI3 — periférico SEPARADO do CC1101
-//   - CS=-1 no begin() → driver NÃO gerencia CS → digitalWrite funciona
-//   - radio.begin(&nrf24SPI) → RF24 usa NOSSO barramento, nunca toca global SPI
-//   - nrf24Sleep() → radio.powerDown() quando sai do menu NRF24
+// NRF24 Driver - usando SPI global (VSPI)
 // ============================================================
 
-// Barramento SPI DEDICADO para NRF24 (VSPI = SPI3, periférico separado do HSPI)
-static SPIClass nrf24SPI(VSPI);
-static bool nrf24BusInitialized = false;
-
-// Construtor global — _spi aponta para global SPI, mas será sobrescrito em nrf24Init()
+// Não precisamos de SPIClass separado, usaremos SPI (VSPI)
 RF24 radio(NRF_CE, NRF_CSN);
 
 struct NRFDevice {
@@ -83,7 +67,7 @@ static uint32_t specFrames = 0;
 
 const uint8_t dummyAddress[5] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE};
 
-// Forward declarations (non-static: chamadas por menu.cpp e wifi_api.cpp)
+// Forward declarations
 void nrf24StopJammer();
 void nrf24StopScan();
 void nrf24StopAnalyze();
@@ -105,36 +89,29 @@ bool nrf24Init() {
     Serial.println(F("[NRF24] Inicializando..."));
     Serial.flush();
 
-    // Configura pinos CE/CSN ANTES do SPI.begin
     pinMode(NRF_CE, OUTPUT);
     pinMode(NRF_CSN, OUTPUT);
     digitalWrite(NRF_CE, LOW);
     digitalWrite(NRF_CSN, HIGH);
     delay(10);
 
-    // Inicializa barramento VSPI DEDICADO (NUNCA toca o global SPI)
-    // CS=-1 → driver NÃO gerencia o pino CS → digitalWrite funciona
-    nrf24SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, -1);
-    nrf24SPI.setFrequency(8000000);
-    nrf24SPI.setDataMode(SPI_MODE0);
-    nrf24SPI.setBitOrder(MSBFIRST);
-    nrf24BusInitialized = true;
+    // Configura SPI global como VSPI (pinos definidos em config.h)
+    SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, -1);
+    SPI.setFrequency(8000000);
+    SPI.setDataMode(SPI_MODE0);
+    SPI.setBitOrder(MSBFIRST);
     delay(10);
 
-    // Reset fisico do modulo
     hardResetNRF24();
 
-    // Inicializa radio com NOSSO barramento dedicado.
-    // begin(SPIClass*) NÃO chama _spi->begin() internamente —
-    // apenas atribui o ponteiro. Por isso chamamos nrf24SPI.begin() acima.
-    Serial.println(F("[NRF24] Chamando radio.begin(&nrf24SPI)..."));
+    Serial.println(F("[NRF24] Chamando radio.begin(&SPI)..."));
     Serial.flush();
-    if (!radio.begin(&nrf24SPI)) {
+    if (!radio.begin(&SPI)) {
         Serial.println(F("[NRF24] FAIL: radio.begin() retornou false"));
         Serial.flush();
         return false;
     }
-    Serial.println(F("[NRF24] radio.begin() OK (barramento VSPI dedicado)"));
+    Serial.println(F("[NRF24] radio.begin() OK (SPI global VSPI)"));
     Serial.flush();
 
     radio.setPALevel(RF24_PA_MAX, true);
@@ -150,17 +127,12 @@ bool nrf24Init() {
 }
 
 // ============================================================
-// SLEEP — coloca NRF24 em modo de baixo consumo.
-// Chamado por goBack() ao sair de qualquer menu NRF24.
-// Isso garante que o NRF24 libere o barramento SPI corretamente
-// e não interfira com o CC1101.
+// SLEEP
 // ============================================================
 void nrf24Sleep() {
     if (nrf24JammerActive) { nrf24StopJammer(); }
     if (scanning) { nrf24StopScan(); }
     if (analyzing) { nrf24StopAnalyze(); }
-    // powerDown() escreve CONFIG=0x00 no NRF24 (PWR_UP=0)
-    // e garante CE=LOW. Libera o rádio completamente.
     radio.powerDown();
     Serial.println(F("[NRF24] Modulo em POWER DOWN"));
     Serial.flush();
@@ -214,16 +186,14 @@ void nrf24ScanLoop() {
 }
 
 // ============================================================
-// ANALYZER (SNIFFER NÃO-BLOQUEANTE CORRIGIDO)
+// ANALYZER (SNIFFER NÃO-BLOQUEANTE)
 // ============================================================
 void nrf24StartAnalyze() {
     analyzing = true;
     detectedCount = 0;
     analyzeSelectedIndex = 0;
     analyzeCurrentCh = 0;
-    
     for (int i = 0; i < NRF_MAX_DETECTED; i++) detectedSignals[i].active = false;
-    
     radio.setPALevel(RF24_PA_MAX);
     radio.setDataRate(RF24_1MBPS);
     radio.setAutoAck(false);
@@ -234,22 +204,17 @@ void nrf24StartAnalyze() {
 
 void nrf24AnalyzeTick() {
     if (!analyzing) return;
-
-    radio.stopListening(); 
+    radio.stopListening();
     radio.setChannel(analyzeCurrentCh);
-    radio.startListening(); 
-    delayMicroseconds(200); 
-    
+    radio.startListening();
+    delayMicroseconds(200);
     bool rpd = radio.testRPD();
     bool cd = radio.testCarrier();
-    
-    radio.stopListening(); 
+    radio.stopListening();
     radio.flush_rx();
-
     if (rpd || cd) {
-        uint8_t power = rpd ? 100 : 50; 
+        uint8_t power = rpd ? 100 : 50;
         bool found = false;
-        
         for (int i = 0; i < detectedCount; i++) {
             if (detectedSignals[i].channel == analyzeCurrentCh) {
                 detectedSignals[i].power = max(detectedSignals[i].power, power);
@@ -259,7 +224,6 @@ void nrf24AnalyzeTick() {
                 break;
             }
         }
-        
         if (!found && detectedCount < NRF_MAX_DETECTED) {
             detectedSignals[detectedCount].channel = analyzeCurrentCh;
             detectedSignals[detectedCount].power = power;
@@ -268,16 +232,11 @@ void nrf24AnalyzeTick() {
             detectedCount++;
         }
     }
-
     analyzeCurrentCh++;
     if (analyzeCurrentCh >= 125) analyzeCurrentCh = 0;
 }
 
-void nrf24StopAnalyze() {
-    analyzing = false;
-    radio.stopListening();
-}
-
+void nrf24StopAnalyze() { analyzing = false; radio.stopListening(); }
 bool nrf24IsAnalyzing() { return analyzing; }
 uint8_t nrf24GetDetectedCount() { return detectedCount; }
 DetectedSignal* nrf24GetDetected(uint8_t index) { if (index < detectedCount) return &detectedSignals[index]; return nullptr; }
@@ -312,9 +271,7 @@ void nrf24SpecInit() {
 
 void nrf24SpecScan() {
     if (!specRunning) return;
-    
     int signalsFoundThisScan = 0;
-
     for (int ch = 0; ch < 125; ch++) {
         radio.stopListening();
         radio.setChannel(ch);
@@ -324,34 +281,22 @@ void nrf24SpecScan() {
         bool rpd = radio.testRPD();
         radio.stopListening();
         radio.flush_rx();
-
         int barIdx = map(ch, 0, 124, 0, SPEC_BARS_FLIPPER - 1);
         int targetHeight = 0;
-        
-        if (rpd) targetHeight = SPEC_MAX_HEIGHT_FLIPPER;       
-        else if (cd) targetHeight = SPEC_MAX_HEIGHT_FLIPPER / 2; 
-
+        if (rpd) targetHeight = SPEC_MAX_HEIGHT_FLIPPER;
+        else if (cd) targetHeight = SPEC_MAX_HEIGHT_FLIPPER / 2;
         if (targetHeight > 0) signalsFoundThisScan++;
-
         if (targetHeight > specCurrentHeights[barIdx]) {
             specCurrentHeights[barIdx] = targetHeight;
         } else {
             if (specCurrentHeights[barIdx] > 0) specCurrentHeights[barIdx]--;
         }
-
         if (specCurrentHeights[barIdx] > specPeakHeights[barIdx]) {
             specPeakHeights[barIdx] = specCurrentHeights[barIdx];
         } else {
             if (specPeakHeights[barIdx] > 0) specPeakHeights[barIdx]--;
         }
     }
-
-    static unsigned long lastPrint = 0;
-    if (millis() - lastPrint > 1000) {
-        lastPrint = millis();
-        Serial.printf("[NRF24 SCANNER] Varredura completa. Sinais detectados: %d/125\n", signalsFoundThisScan);
-    }
-
     for (int y = WATERFALL_ROWS - 1; y > 0; y--) {
         for (int x = 0; x < (SPEC_BARS_FLIPPER / 8); x++) {
             waterfallData[y][x] = waterfallData[y-1][x];
@@ -403,10 +348,7 @@ void nrf24SpecSetAnalysisChannel(int8_t ch) { (void)ch; }
 #define JAM_SWITCH_INTERVAL_US 200
 void nrf24StartJammer() {
     if (nrf24JammerActive) return;
-    if (!radio.isChipConnected()) {
-        Serial.println(F("[NRF24] JAMMER: modulo nao conectado!"));
-        return;
-    }
+    if (!radio.isChipConnected()) return;
     nrf24JammerActive = true;
     jamTotalPackets = 0;
     jamChannelPackets = 0;
@@ -421,7 +363,6 @@ void nrf24StartJammer() {
     radio.setCRCLength(RF24_CRC_DISABLED);
     radio.setChannel(0);
     radio.startConstCarrier(RF24_PA_MAX, 0);
-    Serial.println(F("[NRF24] JAMMER: iniciado (1MBPS, channel hopping 0-125)"));
 }
 void nrf24StopJammer() {
     if (!nrf24JammerActive) return;
