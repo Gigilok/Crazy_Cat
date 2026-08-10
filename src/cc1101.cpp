@@ -569,12 +569,15 @@ bool cc1101Init() {
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
 
-    // Primeiro spiStart() vai chamar hspi->begin(pins)
-    spiStart();
+    // Inicializa o bus HSPI (reconfigura GPIO matrix)
+    // NÃO usa spiStart() aqui porque spiStart() também abre beginTransaction.
+    // Queremos só o begin(), sem transação aberta.
+    hspi->begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
+    spiBusActive = true;
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
 
-    // Reset manual (bus já está ativo via spiStart)
+    // Reset manual (agora spiStart() só faz beginTransaction, sem begin)
     spiStart();
     digitalWrite(CC1101_CSN, LOW);
     delay(1);
