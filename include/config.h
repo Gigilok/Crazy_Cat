@@ -22,7 +22,7 @@
 
 // CC1101 agora no mesmo barramento VSPI do NRF24
 #define CC1101_GDO0 17
-#define CC1101_CSN  15
+#define CC1101_CSN  14
 #define CC1101_SCK  18    // VSPI SCK
 #define CC1101_MOSI 23    // VSPI MOSI
 #define CC1101_MISO 19    // VSPI MISO
