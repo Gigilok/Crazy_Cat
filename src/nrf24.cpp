@@ -83,10 +83,10 @@ static uint32_t specFrames = 0;
 
 const uint8_t dummyAddress[5] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE};
 
-// Forward declarations
-static void nrf24StopJammer();
-static void nrf24StopScan();
-static void nrf24StopAnalyze();
+// Forward declarations (non-static: chamadas por menu.cpp e wifi_api.cpp)
+void nrf24StopJammer();
+void nrf24StopScan();
+void nrf24StopAnalyze();
 
 static void hardResetNRF24() {
     digitalWrite(NRF_CE, LOW);
