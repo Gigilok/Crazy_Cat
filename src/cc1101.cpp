@@ -131,58 +131,108 @@ void IRAM_ATTR cc1101ISR() {
 }
 
 // ============================================================
-// SPI (usando SPI global = VSPI)
+// SPI (usando SPI global = VSPI compartilhado com NRF24)
+// ------------------------------------------------------------
+// PROBLEMA ORIGINAL (resolvido aqui):
+//   O CC1101 e o NRF24 compartilham o mesmo barramento SPI (VSPI).
+//   O driver antigo chamava SPI.transfer() direto, sem
+//   SPI.beginTransaction()/endTransaction(). Isso causava race
+//   condition com a biblioteca RF24 do NRF24, que também assume
+//   controle do barramento. Resultado: a leitura de PARTNUM/VERSION
+//   retornava 0xFF e o CC1101 era reportado como "nao responde".
+//
+// CORRECAO (baseada no ESP32-DIV / SmartRC-CC1101):
+//   1. Toda operacao SPI do CC1101 eh envelopada por
+//      SPI.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0))
+//      e SPI.endTransaction(). Isso reconfigura o barramento para
+//      4 MHz, MODE0 (CC1101 nao aguenta > 10 MHz e usa MODE0).
+//   2. Antes de baixar o CSN do CC1101, subimos o CSN do NRF24
+//      (e vice-versa) para garantir que apenas um slave fale no
+//      barramento. A biblioteca RF24 soh sobe o CSN quando termina
+//      a propria transacao, mas o SPI global pode estar "livre"
+//      com o CSN do NRF24 ainda em LOW em casos de abort.
+//   3. Esperamos MISO em LOW (CC1101 pronto) antes de transferir.
 // ============================================================
+
+// Configuracao SPI para o CC1101: 4 MHz, MODE0, MSB first.
+// O CC1101 aguenta ate 10 MHz, mas 4 MHz eh o padrao usado pelo
+// ESP32-DIV e garante margem em wiring com fios jumpers.
+static const SPISettings CC1101_SPI_SETTINGS(4000000, MSBFIRST, SPI_MODE0);
+
 static void cs_low()  { digitalWrite(CC1101_CSN, LOW); }
 static void cs_high() { digitalWrite(CC1101_CSN, HIGH); }
+
+// Sobe o CSN do NRF24 para liberar o barramento MISO.
+// Necessario porque o NRF24 compartilha os mesmos SCK/MOSI/MISO.
+static void nrf24_release_bus() {
+    pinMode(NRF_CSN, OUTPUT);
+    digitalWrite(NRF_CSN, HIGH);
+    pinMode(NRF_CE, OUTPUT);
+    digitalWrite(NRF_CE, LOW);  // CE em LOW = standby, evita TX/RX acidental
+}
 
 static bool waitMisoReady() {
     uint32_t start = micros();
     while (digitalRead(CC1101_MISO) != LOW) {
-        if (micros() - start > 1000) return false;
+        if (micros() - start > 2000) return false;
     }
     return true;
 }
 
 uint8_t cc1101ReadReg(uint8_t reg) {
+    nrf24_release_bus();
+    SPI.beginTransaction(CC1101_SPI_SETTINGS);
     cs_low();
     waitMisoReady();
     SPI.transfer(reg | CC1101_READ_SINGLE);
     uint8_t val = SPI.transfer(0x00);
     cs_high();
+    SPI.endTransaction();
     return val;
 }
 
 uint8_t cc1101ReadStatus(uint8_t reg) {
+    nrf24_release_bus();
+    SPI.beginTransaction(CC1101_SPI_SETTINGS);
     cs_low();
     waitMisoReady();
     SPI.transfer(reg | CC1101_READ_BURST);
     uint8_t val = SPI.transfer(CC1101_SNOP);
     cs_high();
+    SPI.endTransaction();
     return val;
 }
 
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
+    nrf24_release_bus();
+    SPI.beginTransaction(CC1101_SPI_SETTINGS);
     cs_low();
     waitMisoReady();
     SPI.transfer(reg);
     SPI.transfer(value);
     cs_high();
+    SPI.endTransaction();
 }
 
 static void cc1101WriteRegBurst(uint8_t reg, uint8_t* data, uint8_t len) {
+    nrf24_release_bus();
+    SPI.beginTransaction(CC1101_SPI_SETTINGS);
     cs_low();
     waitMisoReady();
     SPI.transfer(reg | CC1101_WRITE_BURST);
     for (uint8_t i = 0; i < len; i++) SPI.transfer(data[i]);
     cs_high();
+    SPI.endTransaction();
 }
 
 void cc1101SendCommand(uint8_t cmd) {
+    nrf24_release_bus();
+    SPI.beginTransaction(CC1101_SPI_SETTINGS);
     cs_low();
     waitMisoReady();
     SPI.transfer(cmd);
     cs_high();
+    SPI.endTransaction();
 }
 
 // ============================================================
@@ -243,20 +293,54 @@ static void cc1101SetFrequencyCalibrated(uint32_t freqHz) {
 // ============================================================
 // Reset e configuração
 // ============================================================
+// Reset do CC1101 conforme datasheet:
+//  1. Sobe CSN (HIGH) por >40us
+//  2. Baixa CSN (LOW) por >40us
+//  3. Sobe CSN novamente e espera MISO ir para LOW
+//  4. Envia strobe SRES (0x30)
+//  5. Espera MISO voltar para LOW (chip resetou)
+//  6. Sobe CSN
+//
+// Tudo envelopado por beginTransaction/endTransaction para nao
+// conflitar com o NRF24.
 static bool cc1101Reset() {
-    cs_high();
-    delay(2);
+    nrf24_release_bus();
+
+    // Configura pinos SPI do CC1101 manualmente em estado idle
+    pinMode(CC1101_CSN, OUTPUT);
+    pinMode(CC1101_SCK, OUTPUT);
+    pinMode(CC1101_MOSI, OUTPUT);
+    pinMode(CC1101_MISO, INPUT);
+
+    SPI.beginTransaction(CC1101_SPI_SETTINGS);
+
+    // Pulso de reset hardware-style (datasheet sec. 10.1)
+    cs_high(); delayMicroseconds(50);
+    cs_low();  delayMicroseconds(50);
+    cs_high(); delayMicroseconds(50);
     cs_low();
-    delay(2);
-    cs_high();
-    delay(2);
-    cs_low();
-    delay(1);
-    waitMisoReady();
+
+    // Espera MISO baixar (chip pronto pra receber comando)
+    uint32_t start = micros();
+    while (digitalRead(CC1101_MISO) != LOW) {
+        if (micros() - start > 5000) {
+            Serial.println(F("[CC1101] Reset: timeout esperando MISO"));
+            cs_high();
+            SPI.endTransaction();
+            return false;
+        }
+    }
+
     SPI.transfer(CC1101_SRES);
-    delayMicroseconds(150);
-    waitMisoReady();
+
+    // Espera MISO voltar a LOW (reset completou)
+    start = micros();
+    while (digitalRead(CC1101_MISO) != LOW) {
+        if (micros() - start > 5000) break;
+    }
+
     cs_high();
+    SPI.endTransaction();
     delay(2);
     return true;
 }
@@ -300,7 +384,8 @@ static void cc1101ConfigureRegs() {
 // Inicialização
 // ============================================================
 bool cc1101Init() {
-    Serial.println("[CC1101] Inicializando...");
+    Serial.println(F("[CC1101] Inicializando..."));
+    Serial.flush();
 
     if (!isr_service_installed) {
         esp_err_t err = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
@@ -308,27 +393,76 @@ bool cc1101Init() {
         else if (err == ESP_ERR_INVALID_STATE) isr_service_installed = true;
     }
 
+    // Garante estado deterministico dos pinos CC1101
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
+    pinMode(CC1101_SCK, OUTPUT);
+    pinMode(CC1101_MOSI, OUTPUT);
+    pinMode(CC1101_MISO, INPUT);
+
+    // Libera o NRF24 do barramento SPI compartilhado antes de qualquer
+    // coisa. Sem isso, o MISO pode estar sendo puxado LOW pelo NRF24 e
+    // o CC1101 nunca responde.
+    nrf24_release_bus();
     delay(10);
 
-    cc1101Reset();
+    // Tentativa de reset + leitura com retry (ate 3x).
+    // Se a primeira tentativa falhar (modulo ainda acordando, wiring ruidoso,
+    // etc), tentamos novamente apos um delay maior.
+    uint8_t partnum = 0xFF;
+    uint8_t version = 0xFF;
 
-    uint8_t partnum = cc1101ReadStatus(CC1101_PARTNUM);
-    uint8_t version = cc1101ReadStatus(CC1101_VERSION);
-    Serial.printf("[CC1101] PARTNUM=0x%02X VERSION=0x%02X\n", partnum, version);
+    for (int attempt = 1; attempt <= 3; attempt++) {
+        Serial.print(F("[CC1101] Reset attempt "));
+        Serial.print(attempt);
+        Serial.println(F("/3"));
+        Serial.flush();
 
-    if (partnum == 0xFF || version == 0xFF) {
-        Serial.println("[CC1101] FAIL: modulo nao responde");
+        if (!cc1101Reset()) {
+            Serial.println(F("[CC1101] Reset falhou (timeout MISO)"));
+            delay(50);
+            continue;
+        }
+
+        delay(5);
+
+        partnum = cc1101ReadStatus(CC1101_PARTNUM);
+        version = cc1101ReadStatus(CC1101_VERSION);
+        Serial.print(F("[CC1101] PARTNUM=0x"));
+        Serial.print(partnum, HEX);
+        Serial.print(F(" VERSION=0x"));
+        Serial.println(version, HEX);
+        Serial.flush();
+
+        // CC1101 genuino: PARTNUM=0x00, VERSION=0x04 (rev B) ou 0x14 (rev C/E)
+        // Aceitamos qualquer valor != 0x00 e != 0xFF como "respondeu".
+        if (partnum != 0xFF && partnum != 0x00) {
+            break;  // sucesso
+        }
+        if (version != 0xFF && version != 0x00) {
+            break;  // sucesso
+        }
+
+        // Falhou — espera e tenta de novo
+        delay(100);
+    }
+
+    if (partnum == 0xFF || partnum == 0x00) {
+        Serial.println(F("[CC1101] FAIL: modulo nao responde (PARTNUM invalido)"));
+        Serial.println(F("[CC1101] Verifique:"));
+        Serial.println(F("  - Fios SCK/MOSI/MISO/CSN conectados"));
+        Serial.println(F("  - Alimentacao 3.3V (NAO 5V!)"));
+        Serial.println(F("  - NRF24 desconectado durante teste (conflito SPI)"));
         return false;
     }
 
+    Serial.println(F("[CC1101] Modulo respondeu. Configurando registradores..."));
     cc1101ConfigureRegs();
     cc1101Initialized = true;
     cc1101SendCommand(CC1101_SIDLE);
-    Serial.println("[CC1101] OK");
+    Serial.println(F("[CC1101] OK - pronto para uso"));
     return true;
 }
 
