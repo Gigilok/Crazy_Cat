@@ -83,29 +83,13 @@ void setup() {
 
     delay(100);
 
-    // 5. CC1101
-    // IMPORTANTE: o CC1101 e o NRF24 compartilham o mesmo barramento SPI
-    // (VSPI: SCK=18, MOSI=23, MISO=19). O driver do CC1101 agora usa
-    // SPI.beginTransaction()/endTransaction() em cada acesso e sobe o CSN
-    // do NRF24 antes de tocar no barramento, evitando o conflito que
-    // fazia o CC1101 retornar PARTNUM=0xFF ("modulo nao responde").
+    // 5. CC1101 (agora usando ELECHOUSE e mesmo barramento SPI)
     Serial.println("[SETUP] 5. CC1101...");
     Serial.flush();
     cc1101OK = cc1101Init();
     Serial.printf("[SETUP] CC1101: %s\n", cc1101OK ? "OK" : "FAIL");
     Serial.flush();
     if (displayOK) showLoading(cc1101OK ? "CC1101 OK" : "CC1101 FAIL", 60);
-
-    // 5b. Re-inicializa o NRF24 apos o CC1101 ter mexido nos pinos CE/CSN
-    // do NRF24 (durante nrf24_release_bus). Isso garante que o NRF24
-    // continua funcional apos a inicializacao do CC1101.
-    if (nrf24OK) {
-        Serial.println("[SETUP] 5b. Re-init NRF24 (apos CC1101)...");
-        Serial.flush();
-        nrf24OK = nrf24Init();
-        Serial.printf("[SETUP] NRF24 re-init: %s\n", nrf24OK ? "OK" : "FAIL");
-        Serial.flush();
-    }
 
     // 6. WiFi
     Serial.println("[SETUP] 6. WiFi...");
