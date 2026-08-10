@@ -4,11 +4,11 @@
 #include "ELECHOUSE_CC1101_SRC_DRV.h"
 
 // ============================================================
-// Variáveis globais (captura RAW e estado)
+// VARIÁVEIS GLOBAIS
 // ============================================================
 bool cc1101Initialized = false;
 bool cc1101CopyActive = false;
-bool cc1101JammerActive = false;   // definido em config.h como extern
+bool cc1101JammerActive = false;
 uint8_t rj_state = 0;
 unsigned long rj_timer = 0;
 extern unsigned long captureStartTime;
@@ -76,7 +76,22 @@ void IRAM_ATTR cc1101ISR() {
 }
 
 // ============================================================
-// Inicialização via ELECHOUSE (compartilha SPI VSPI)
+// WRAPPERS DE COMPATIBILIDADE (para wifi_attacks.cpp e outros)
+// ============================================================
+void cc1101SetFrequency(uint32_t freqHz) {
+    ELECHOUSE_cc1101.setMHZ(freqHz / 1000000.0f);
+}
+
+void cc1101WriteReg(uint8_t reg, uint8_t value) {
+    ELECHOUSE_cc1101.SpiWriteReg(reg, value);
+}
+
+void cc1101SendCommand(uint8_t cmd) {
+    ELECHOUSE_cc1101.SpiStrobe(cmd);
+}
+
+// ============================================================
+// INICIALIZAÇÃO
 // ============================================================
 bool cc1101Init() {
     Serial.println("[CC1101] Inicializando via ELECHOUSE...");
@@ -90,24 +105,24 @@ bool cc1101Init() {
         }
     }
 
-    // Configura os pinos do CC1101 na biblioteca ELECHOUSE
+    // Configura os pinos na biblioteca
     ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
     ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
 
-    // Verifica se o módulo responde (isso também inicializa o SPI internamente)
+    // Verifica comunicação
     if (!ELECHOUSE_cc1101.getCC1101()) {
         Serial.println("[CC1101] FAIL: modulo nao detectado");
         return false;
     }
 
-    // Inicializa o rádio com as configurações padrão para captura RAW
+    // Inicializa com as configurações padrão para captura RAW
     ELECHOUSE_cc1101.Init();
-    ELECHOUSE_cc1101.setCCMode(0);       // modo compatível com dados seriais (GDO0 = clock, GDO2 = dados)
+    ELECHOUSE_cc1101.setCCMode(0);       // GDO0 = serial clock, GDO2 = serial data
     ELECHOUSE_cc1101.setModulation(2);   // ASK/OOK
     ELECHOUSE_cc1101.setMHZ(433.92);     // frequência inicial
-    ELECHOUSE_cc1101.setRxBW(500.0);     // largura de banda
-    ELECHOUSE_cc1101.setPA(12);          // potência de transmissão
-    ELECHOUSE_cc1101.setSidle();         // IDLE state
+    ELECHOUSE_cc1101.setRxBW(500.0);     // largura de banda de 500 kHz
+    ELECHOUSE_cc1101.setPA(12);          // potência de transmissão máxima
+    ELECHOUSE_cc1101.setSidle();         // estado IDLE
 
     cc1101Initialized = true;
     Serial.println("[CC1101] OK");
@@ -115,7 +130,7 @@ bool cc1101Init() {
 }
 
 // ============================================================
-// Sleep / Wake (usando funções da ELECHOUSE)
+// SLEEP / WAKE
 // ============================================================
 void cc1101Sleep() {
     if (!cc1101Initialized) return;
@@ -127,7 +142,7 @@ void cc1101Sleep() {
 
 bool cc1101Wake() {
     if (!cc1101Initialized) return false;
-    // A ELECHOUSE não tem um "wake" específico, então reinicializamos
+    // Reinicializa o rádio
     ELECHOUSE_cc1101.Init();
     ELECHOUSE_cc1101.setCCMode(0);
     ELECHOUSE_cc1101.setModulation(2);
@@ -143,7 +158,7 @@ bool cc1101Wake() {
 }
 
 // ============================================================
-// GoRx usando ELECHOUSE
+// GoRx (coloca o rádio em RX em uma frequência específica)
 // ============================================================
 static bool cc1101GoRx(uint32_t freqHz) {
     float mhz = freqHz / 1000000.0f;
@@ -158,11 +173,14 @@ static bool cc1101GoRx(uint32_t freqHz) {
 }
 
 // ============================================================
-// Captura RAW (usa ISR, mas com ELECHOUSE para RX)
+// CAPTURA RAW (hopping + ISR)
 // ============================================================
 void cc1101StartCapture() {
     if (!cc1101Initialized) return;
-    if (!cc1101Wake()) return;
+    if (!cc1101Wake()) {
+        Serial.println("[CC1101] CAPTURE: falha ao acordar!");
+        return;
+    }
     cc1101CopyActive = true;
     currentCapture.count = 0;
     currentCapture.startTime = millis();
@@ -194,7 +212,8 @@ void cc1101CaptureLoop() {
     if (capture_state == STATE_HOPPING) {
         if (isr_count > 5) {
             capture_state = STATE_LOCKED;
-            Serial.printf("[CC1101] LOCKED freq=%luM, pulses=%d\n", currentCapture.frequency / 1000000, isr_count);
+            Serial.printf("[CC1101] LOCKED freq=%luM, pulses=%d\n",
+                currentCapture.frequency / 1000000, isr_count);
         }
         else if (nowMs - lastFreqSwitch > 1000) {
             if (isr_count == 0 && !capture_started) {
@@ -304,7 +323,7 @@ uint32_t cc1101GetCurrentFreq() { return currentCapture.frequency / 1000000; }
 uint8_t cc1101GetPinState() { return digitalRead(CC1101_GDO0); }
 
 // ============================================================
-// REPLAY (usando ELECHOUSE para TX)
+// REPLAY (TX)
 // ============================================================
 void cc1101ReplaySignal(uint8_t index) {
     if (index >= savedSignalCount || !savedSignals[index].valid) return;
@@ -328,8 +347,41 @@ void cc1101ReplaySignal(uint8_t index) {
     cc1101Sleep();
 }
 
+// ============================================================
+// BRUTE FORCE (simplificado, mantém compatibilidade)
+// ============================================================
 void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
-    // ... adaptar conforme necessário (similar ao replay)
+    if (!cc1101Initialized) return;
+    if (!cc1101Wake()) return;
+    isr_enabled = false;
+    ELECHOUSE_cc1101.setMHZ(freq / 1000000.0f);
+    ELECHOUSE_cc1101.setSidle();
+    delay(1);
+    ELECHOUSE_cc1101.SetTx();
+    pinMode(CC1101_GDO0, OUTPUT);
+    digitalWrite(CC1101_GDO0, LOW);
+    for (int rep = 0; rep < 3; rep++) {
+        for (int i = 23; i >= 0; i--) {
+            bool bit = (code >> i) & 0x01;
+            if (bit) {
+                digitalWrite(CC1101_GDO0, HIGH); delayMicroseconds(900);
+                digitalWrite(CC1101_GDO0, LOW); delayMicroseconds(300);
+                digitalWrite(CC1101_GDO0, HIGH); delayMicroseconds(900);
+                digitalWrite(CC1101_GDO0, LOW); delayMicroseconds(300);
+            } else {
+                digitalWrite(CC1101_GDO0, HIGH); delayMicroseconds(300);
+                digitalWrite(CC1101_GDO0, LOW); delayMicroseconds(900);
+                digitalWrite(CC1101_GDO0, HIGH); delayMicroseconds(300);
+                digitalWrite(CC1101_GDO0, LOW); delayMicroseconds(900);
+            }
+        }
+        digitalWrite(CC1101_GDO0, HIGH); delayMicroseconds(300);
+        digitalWrite(CC1101_GDO0, LOW); delayMicroseconds(9300);
+    }
+    digitalWrite(CC1101_GDO0, LOW);
+    pinMode(CC1101_GDO0, INPUT_PULLUP);
+    ELECHOUSE_cc1101.setSidle();
+    cc1101Sleep();
 }
 
 // ============================================================
@@ -358,7 +410,7 @@ void cc1101StopSubGHzJammer() {
 }
 
 // ============================================================
-// ROLLJAM (adaptado)
+// ROLLJAM
 // ============================================================
 void cc1101StartRollJam() {
     if (!cc1101Initialized) return;
@@ -432,7 +484,7 @@ void cc1101StopRollJam() {
 }
 
 // ============================================================
-// ANALISADOR DE ESPECTRO (adaptado)
+// ANALISADOR DE ESPECTRO
 // ============================================================
 void cc1101StartAnalyzer() {
     if (!cc1101Initialized) return;
@@ -474,16 +526,22 @@ void cc1101StopAnalyzer() {
 }
 
 bool cc1101AnalyzerIsRunning() { return spec_an_running; }
+
 uint16_t cc1101GetAnalyzerValue(int idx) {
     if (idx < 0 || idx >= 64) return 0;
     return spec_an_values[idx];
 }
+
 uint32_t cc1101GetAnalyzerFreq(int idx) {
     if (idx < 0 || idx >= 64) return 0;
     return spec_an_freqs[idx] / 1000000;
 }
+
 uint8_t cc1101GetAnalyzerSelected() { return spec_an_idx; }
 
+// ============================================================
+// GERENCIAMENTO DE SINAIS SALVOS
+// ============================================================
 void cc1101ClearSavedSignals() {
     savedSignalCount = 0;
     memset(savedSignals, 0, sizeof(savedSignals));
@@ -499,7 +557,7 @@ void cc1101DeleteSignal(uint8_t index) {
 }
 
 // ============================================================
-// TRANSMIT RAW (para uso externo)
+// TRANSMISSÃO RAW (para Termux etc.)
 // ============================================================
 void cc1101TransmitRaw(uint32_t frequency, uint16_t* timings, uint8_t length) {
     if (!cc1101Initialized || length == 0 || length > 200) return;
@@ -521,11 +579,21 @@ void cc1101TransmitRaw(uint32_t frequency, uint16_t* timings, uint8_t length) {
     cc1101Sleep();
 }
 
+// ============================================================
+// STATUS
+// ============================================================
 bool cc1101IsAvailable() { return cc1101Initialized; }
 bool cc1101IsCapturing() { return cc1101CopyActive; }
 uint8_t cc1101GetSavedCount() { return savedSignalCount; }
-SignalData* cc1101GetSignal(uint8_t index) { if (index < savedSignalCount) return &savedSignals[index]; return nullptr; }
 
+SignalData* cc1101GetSignal(uint8_t index) {
+    if (index < savedSignalCount) return &savedSignals[index];
+    return nullptr;
+}
+
+// ============================================================
+// DRONE RSSI (para localização)
+// ============================================================
 int8_t cc1101GetDroneRSSI() {
     if (!cc1101Initialized) return 0;
     if (!cc1101Wake()) return 0;
