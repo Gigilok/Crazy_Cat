@@ -387,7 +387,6 @@ static void cc1101ConfigureRegs() {
     cc1101WriteReg(CC1101_IOCFG0,   0x0D);
     cc1101WriteReg(CC1101_PKTCTRL0, 0x32);
     cc1101WriteReg(CC1101_MDMCFG3,  0x93);
-    cc1101WriteReg(CC1101_MDMCFG4,  0x07);
     cc1101WriteReg(CC1101_MDMCFG2,  0x30);
     cc1101WriteReg(CC1101_FREND0,   0x11);
     cc1101WriteReg(CC1101_FSCTRL1,  0x06);
@@ -396,7 +395,7 @@ static void cc1101ConfigureRegs() {
     cc1101WriteReg(CC1101_CHANNR,   0x00);
     cc1101WriteReg(CC1101_DEVIATN,  0x47);
     cc1101WriteReg(CC1101_FREND1,   0x56);
-    cc1101WriteReg(CC1101_MCSM0,    0x38);
+    cc1101WriteReg(CC1101_MCSM0,    0x18);
     cc1101WriteReg(CC1101_FOCCFG,   0x16);
     cc1101WriteReg(CC1101_BSCFG,    0x1C);
     cc1101WriteReg(CC1101_AGCCTRL2, 0xC7);
@@ -537,7 +536,7 @@ static bool cc1101GoRx(uint32_t freqHz) {
     Serial.printf("[CC1101] GoRx S2: pos-cal=0x%02X\n", state);
 
     cc1101SendCommand(CC1101_SIDLE);
-    delayMicroseconds(100);
+    delayMicroseconds(150);
     cc1101SendCommand(CC1101_SRX);
     Serial.println("[CC1101] GoRx S3: SRX enviado, aguardando...");
 
