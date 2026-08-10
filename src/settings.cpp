@@ -1,10 +1,29 @@
 #include "config.h"
 
+// Flag para re-inicializar o HSPI do CC1101 após testAllPins()
+// (mantido por compatibilidade, mas testAllPins agora NÃO destrói os pinos)
+extern bool cc1101NeedsSpiReinit;
+
 struct PinTest {
     const char* name;
     uint8_t pin;
     bool working;
 };
+
+// Pinos SPI do HSPI (CC1101) e VSPI (NRF24) — NÃO testar!
+// pinMode() nesses pinos destrói o GPIO matrix do SPI.
+static const uint8_t spiPins[] = {
+    CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN,  // HSPI: 14,12,13,15
+    NRF_SCK, NRF_MISO, NRF_MOSI, NRF_CSN              // VSPI: 18,19,23,25
+};
+static const uint8_t spiPinCount = sizeof(spiPins) / sizeof(spiPins[0]);
+
+static bool isSpiPin(uint8_t pin) {
+    for (uint8_t i = 0; i < spiPinCount; i++) {
+        if (spiPins[i] == pin) return true;
+    }
+    return false;
+}
 
 PinTest pinTests[] = {
     {"OLED SDA", OLED_SDA, false},
@@ -30,18 +49,31 @@ const uint8_t pinTestCount = sizeof(pinTests) / sizeof(pinTests[0]);
 void testAllPins() {
     for (int i = 0; i < pinTestCount; i++) {
         uint8_t pin = pinTests[i].pin;
-        pinMode(pin, OUTPUT);
-        digitalWrite(pin, HIGH);
-        delay(5);
+
+        // NUNCA faz pinMode() em pinos SPI — isso destrói o GPIO matrix
+        // e quebra o barramento SPI. Testa apenas leitura.
+        if (isSpiPin(pin)) {
+            pinTests[i].working = true;  // Assume OK (não podemos testar sem destruir)
+            continue;
+        }
+
+        // Pinos de botão: testa com INPUT_PULLUP
         if (pin == BTN_UP || pin == BTN_DOWN || pin == BTN_SELECT || pin == BTN_BACK) {
             pinMode(pin, INPUT_PULLUP);
             delay(5);
             pinTests[i].working = (digitalRead(pin) == HIGH);
         } else {
+            // Pinos normais: teste de OUTPUT
+            pinMode(pin, OUTPUT);
+            digitalWrite(pin, HIGH);
+            delay(5);
             pinTests[i].working = true;
         }
         delay(5);
     }
+    // NÃO precisa mais de cc1101NeedsSpiReinit porque não destruímos os pinos SPI
+    // Mas setamos como precaução caso algum outro código tenha alterado os pinos
+    cc1101NeedsSpiReinit = true;
 }
 
 uint8_t getPinTestCount() { return pinTestCount; }
@@ -72,7 +104,7 @@ void testModules(bool nrfOk, bool cc1101Ok, bool btOk) {
     modules[1].connected = cc1101Ok;
     modules[1].working = cc1101Ok;
     modules[2].connected = true;
-    modules[2].working = wifiEnabled;  // <<< LINHA MUDADA (antes era: true)
+    modules[2].working = wifiEnabled;
     modules[3].connected = btOk;
     modules[3].working = btOk;
     modules[4].connected = true;
