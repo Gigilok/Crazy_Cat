@@ -3,7 +3,26 @@
 #include "config.h"
 
 // ============================================================
-// CC1101 Driver - SPI DEDICADO HSPI com CS MANUAL (v16)
+// CC1101 Driver - SPI DEDICADO HSPI com CS MANUAL (v17)
+//
+// FIXES v16->v17 (DIAGNOSTICO DE GDO0/GDO2 = 0)
+//
+// DESCOBERTA: O ELECHOUSE seta IOCFG2=0x0D e IOCFG0=0x0D
+// AMBOS como SERIAL_CLOCK. Isso e um "bug" mas funciona no DIV
+// porque o RCSwitch captura transicoes no pino de clock
+// (GDO0 pulsa quando dados entram no FIFO).
+//
+// No Crazy Cat, o ISR captura transicoes do GDO0.
+// Com IOCFG0=0x0D (SERIAL_CLK), GDO0 so pulsa quando o FIFO
+// tem dados (requer deteccao de sync word). Sem sinal RF com
+// formato de pacote valido, GDO0 fica em 0 — COMPORTAMENTO CORRETO.
+//
+// FIX v17:
+// 1. IOCFG2 = 0x0E (SERIAL_DATA) em vez de 0x0D (SERIAL_CLK)
+//    Assim GDO2 emite os dados demodulados.
+// 2. GoRx agora le RSSI e MARCSTATE apos SRX para PROVAR
+//    que o chip esta em RX e recebendo RF.
+// 3. Segundo SIDLE removido antes de SRX (igual ELECHOUSE).
 //
 // FIXES v15->v16 (ANALISE PROFUNDA vs PROJETO DIV)
 //
@@ -438,8 +457,8 @@ static bool cc1101Reset() {
 // ============================================================
 static void cc1101ConfigureRegs() {
     // Ordem identica ao ELECHOUSE RegConfigSettings() com ccmode=0, modulation=2
-    cc1101WriteReg(CC1101_IOCFG2,   0x0D);  // GDO2 = Serial Data Output (TX active)
-    cc1101WriteReg(CC1101_IOCFG0,   0x0D);  // GDO0 = Serial Clock
+    cc1101WriteReg(CC1101_IOCFG2,   0x0E);  // GDO2 = SERIAL_DATA (dados demodulados)
+    cc1101WriteReg(CC1101_IOCFG0,   0x0D);  // GDO0 = SERIAL_CLK (clock de dados)
     cc1101WriteReg(CC1101_PKTCTRL0, 0x32);  // Fixed packet, CRC off, variable length
     cc1101WriteReg(CC1101_MDMCFG3,  0x93);  // Data rate = ~4.8 kBaud
     cc1101WriteReg(CC1101_MDMCFG2,  0x30);  // ASK/OOK modulation, DC filter off
@@ -526,13 +545,13 @@ bool cc1101Init() {
     Serial.println("[CC1101] Configurado com sucesso!");
     Serial.flush();
 
-    // Diagnostico estendido v16 — verifica se leituras sao reais
-    Serial.println("[CC1101] === DIAGNOSTICO v16 ===");
+    // Diagnostico estendido v17 — verifica se leituras sao reais
+    Serial.println("[CC1101] === DIAGNOSTICO v17 ===");
     uint8_t r;
     r = cc1101ReadReg(CC1101_FSCTRL1);  Serial.printf("  FSCTRL1   = 0x%02X %s\n", r, r==0x06?"OK":"FAIL");
     r = cc1101ReadReg(CC1101_FREND1);   Serial.printf("  FREND1    = 0x%02X %s\n", r, r==0x56?"OK":"FAIL");
-    r = cc1101ReadReg(CC1101_IOCFG0);   Serial.printf("  IOCFG0    = 0x%02X (0x0D=SerialClock)\n", r);
-    r = cc1101ReadReg(CC1101_IOCFG2);   Serial.printf("  IOCFG2    = 0x%02X (0x0D=SerialData)\n", r);
+    r = cc1101ReadReg(CC1101_IOCFG0);   Serial.printf("  IOCFG0    = 0x%02X (0x0D=SerialClk)\n", r);
+    r = cc1101ReadReg(CC1101_IOCFG2);   Serial.printf("  IOCFG2    = 0x%02X (0x0E=SerialData)\n", r);
     r = cc1101ReadReg(CC1101_PKTCTRL0); Serial.printf("  PKTCTRL0  = 0x%02X %s\n", r, r==0x32?"OK":"FAIL");
     r = cc1101ReadReg(CC1101_MDMCFG4);  Serial.printf("  MDMCFG4   = 0x%02X (RxBw+DaRa)\n", r);
     r = cc1101ReadReg(CC1101_MDMCFG2);  Serial.printf("  MDMCFG2   = 0x%02X (modulation)\n", r);
@@ -612,10 +631,20 @@ static bool cc1101GoRx(uint32_t freqHz) {
     delay(1);
     cc1101SetFrequency(freqHz);
     cc1101CalibrateBand(freqMHz);
-    cc1101SendCommand(CC1101_SIDLE);
+    // v17: Removido segundo SIDLE — o ELECHOUSE faz SIDLE->setFreq->SRX
+    // sem o segundo SIDLE. O SIDLE extra podia interromper a calibracao.
     delayMicroseconds(150);
     cc1101SendCommand(CC1101_SRX);
-    Serial.printf("[CC1101] GoRx OK @ %lu Hz\n", freqHz);
+    // v17: Diagnostico pos-SRX — le RSSI e MARCSTATE para PROVAR
+    // que o chip esta realmente em RX e recebendo RF
+    delayMicroseconds(500);  // Espera calibracao interna terminar
+    uint8_t marcstate = cc1101ReadStatus(CC1101_MARCSTATE) & 0x1F;
+    uint8_t rssiRaw = cc1101ReadStatus(CC1101_RSSI);
+    int rssiDbm = (rssiRaw >= 128) ? ((int)rssiRaw - 256) / 2 - 74 : (int)rssiRaw / 2 - 74;
+    Serial.printf("[CC1101] GoRx @ %lu Hz | MARCSTATE=0x%02X(%s) RSSI=%ddBm GDO0=%d GDO2=%d\n",
+        freqHz, marcstate,
+        marcstate==0x0D?"RX":marcstate==0x01?"IDLE":marcstate==0x04?"CALIB":"????",
+        rssiDbm, digitalRead(CC1101_GDO0), digitalRead(CC1101_GDO2));
     return true;
 }
 
