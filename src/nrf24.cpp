@@ -62,6 +62,11 @@ static uint32_t specFrames = 0;
 
 const uint8_t dummyAddress[5] = {0xAA, 0xBB, 0xCC, 0xDD, 0xEE};
 
+// Forward declarations (necessárias para nrf24Sleep)
+void nrf24StopJammer();
+void nrf24StopScan();
+void nrf24StopAnalyze();
+
 static void hardResetNRF24() {
     digitalWrite(NRF_CE, LOW);
     delay(150);
@@ -114,6 +119,18 @@ bool nrf24Init() {
     Serial.println(F("[NRF24] Configurado com sucesso!"));
     Serial.flush();
     return true;
+}
+
+// ============================================================
+// SLEEP – chamada por menu.cpp ao sair dos menus NRF24
+// ============================================================
+void nrf24Sleep() {
+    if (nrf24JammerActive) { nrf24StopJammer(); }
+    if (scanning) { nrf24StopScan(); }
+    if (analyzing) { nrf24StopAnalyze(); }
+    radio.powerDown();
+    Serial.println(F("[NRF24] Modulo em POWER DOWN"));
+    Serial.flush();
 }
 
 // SCANNER ANTIGO
