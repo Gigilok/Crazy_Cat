@@ -97,15 +97,53 @@ void IRAM_ATTR cc1101ISR() {
 }
 
 // ============================================================
-// Helper: libera barramento SPI do NRF24 antes de acessar CC1101
-// (mesmo o SmartRC fazendo begin/end, e bom garantir que o CSN do
-// NRF24 esteja HIGH para nao conflitar)
+// reclaimSpiBus - baseado no reclaimSharedSpiBus() do ESP32-DIV
+// ------------------------------------------------------------
+// O SmartRC chama SPI.end() a cada operacao, o que destrói a
+// configuracao do barramento SPI. Quando o NRF24 (RF24 library)
+// tenta usar o barramento depois, ele falha porque SPI.begin()
+// nao foi chamado novamente.
+//
+// Esta funcao faz o que o DIV faz antes de cada operacao CC1101:
+//   1. Sobe TODOS os CS pins (NRF24, CC1101) para HIGH
+//   2. Chama SPI.end() para liberar o barramento
+//   3. Chama SPI.begin() com os pinos do CC1101 para reconfigurar
+//   4. Set frequency/mode/bitorder
+//
+// Isso garante que o barramento esteja sempre em estado conhecido
+// antes de qualquer operacao CC1101, e que o NRF24 possa retomar
+// o barramento depois (RF24 chama SPI.beginTransaction que funciona
+// sobre o SPI.begin que fizemos aqui).
 // ============================================================
-static void nrf24_release_bus() {
+#include "driver/gpio.h"
+
+static void reclaimSpiBus() {
+    // 1. Sobe todos os CS pins para HIGH (desseleciona todos os slaves)
     pinMode(NRF_CSN, OUTPUT);
     digitalWrite(NRF_CSN, HIGH);
     pinMode(NRF_CE, OUTPUT);
-    digitalWrite(NRF_CE, LOW);
+    digitalWrite(NRF_CE, LOW);   // NRF24 em standby
+    pinMode(CC1101_CSN, OUTPUT);
+    digitalWrite(CC1101_CSN, HIGH);
+
+    // 2. Libera o barramento SPI completamente
+    SPI.end();
+
+    // 3. Reconfigura o barramento SPI com os pinos do CC1101
+    //    (mesmos pinos do NRF24 pois compartilham VSPI)
+    SPI.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
+
+    // 4. Configura modo/frequencia
+    SPI.setDataMode(SPI_MODE0);
+    SPI.setBitOrder(MSBFIRST);
+    SPI.setFrequency(4000000);
+
+    delay(2);
+}
+
+// Helper legacy (mantido para compatibilidade)
+static void nrf24_release_bus() {
+    reclaimSpiBus();
 }
 
 // ============================================================
