@@ -8,6 +8,21 @@
 //   - Usa RCSwitch para recepcao (igual ao DIV)
 //   - Nao verifica MARCSTATE (o DIV nao verifica)
 //   - Nao chama goSleep()/SPWD (nenhum dos dois chama)
+//
+// ============================================================
+// CORRECAO PRINCIPAL: Usar GDO2 para RX (igual ao DIV)
+// ------------------------------------------------------------
+// O ESP32-DIV usa GDO2 (SUBGHZ_RX_PIN) para RX, NAO GDO0!
+// No shared.h do DIV:
+//   #define CC1101_GDO0  SUBGHZ_TX_PIN   // GDO0 = TX
+//   #define CC1101_GDO2  SUBGHZ_RX_PIN   // GDO2 = RX
+//
+// E no subghz.cpp:522 do DIV:
+//   mySwitch.enableReceive(REPLAY_RX_PIN);  // ISR no GDO2
+//
+// O codigo anterior do Crazy_Cat usava GDO0 para RX - estava ERRADO.
+// Agora usamos GDO2 (CC1101_GDO2 = pino 16) para tudo que e RX.
+// GDO0 (CC1101_GDO0 = pino 17) fica apenas para TX.
 // ============================================================
 
 #include <SPI.h>
@@ -70,13 +85,14 @@ bool spec_an_running = false;
 static bool spi_owned_by_cc1101 = false;
 
 // ============================================================
-// ISR para captura raw (fallback quando RCSwitch nao resolve)
+// ISR para captura raw - agora no GDO2 (igual ao DIV)
+// O DIV usa GDO2 para RX. Ler GDO2, nao GDO0.
 // ============================================================
 void IRAM_ATTR cc1101ISR() {
     if (!isr_enabled) return;
     unsigned long now = micros();
-    uint8_t gdo0_val = digitalRead(CC1101_GDO0);
-    if (gdo0_val != isr_last_val) {
+    uint8_t gdo2_val = digitalRead(CC1101_GDO2);  // GDO2, nao GDO0
+    if (gdo2_val != isr_last_val) {
         unsigned long dt = now - isr_last_change;
         if (dt > 50 && dt < 100000) {
             if (isr_count < 200) {
@@ -84,7 +100,7 @@ void IRAM_ATTR cc1101ISR() {
                 isr_count++;
             }
         }
-        isr_last_val = gdo0_val;
+        isr_last_val = gdo2_val;
         isr_last_change = now;
         capture_started = true;
     }
@@ -219,7 +235,7 @@ void cc1101Sleep() {
         mySwitch.disableReceive();
         rcswitch_armed = false;
     }
-    detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
+    detachInterrupt(digitalPinToInterrupt(CC1101_GDO2));  // GDO2, nao GDO0
     nrf24_release_bus();
     ELECHOUSE_cc1101.setSidle();
     // NAO chamar goSleep()/SPWD
@@ -264,22 +280,25 @@ static bool cc1101GoRx(uint32_t freqHz) {
     delay(5);
 
     // Log simples (nao bloqueia)
-    uint8_t marcstate = ELECHOUSE_cc1101.SpiReadStatus(0x35) & 0x1F;
-    int rssi = ELECHOUSE_cc1101.getRssi();
     Serial.print(F("[CC1101] GoRx "));
     Serial.print(freqHz);
-    Serial.print(F(" Hz | MARC=0x"));
-    Serial.print(marcstate, HEX);
-    Serial.print(F(" RSSI="));
-    Serial.print(rssi);
-    Serial.print(F(" GDO0="));
-    Serial.println(digitalRead(CC1101_GDO0));
+    Serial.print(F(" Hz | GDO0="));
+    Serial.print(digitalRead(CC1101_GDO0));
+    Serial.print(F(" GDO2="));
+    Serial.println(digitalRead(CC1101_GDO2));
 
     return true;
 }
 
 // ============================================================
 // Captura RAW via RCSwitch (igual ao DIV)
+// ------------------------------------------------------------
+// IMPORTANTE: O DIV usa GDO2 (SUBGHZ_RX_PIN) para RX, nao GDO0!
+// O setGDO(gdo0, gdo2) do SmartRC configura:
+//   - GDO0 como OUTPUT (para TX)
+//   - GDO2 como INPUT (para RX)
+// E o replayArmReceive() do DIV faz:
+//   mySwitch.enableReceive(REPLAY_RX_PIN);  // ISR no GDO2
 // ============================================================
 void cc1101StartCapture() {
     if (!cc1101Initialized) return;
@@ -298,16 +317,18 @@ void cc1101StartCapture() {
 
     cc1101GoRx(currentCapture.frequency);
 
-    // Armar RCSwitch no GDO0 (igual ao DIV arma no GDO2)
-    pinMode(CC1101_GDO0, INPUT);
-    mySwitch.enableReceive(CC1101_GDO0);
+    // Armar RCSwitch no GDO2 (igual ao DIV)
+    // O SmartRC ja configurou GDO2 como INPUT em setGDO()
+    pinMode(CC1101_GDO2, INPUT);
+    pinMode(CC1101_GDO0, INPUT);  // GDO0 tambem como INPUT durante RX
+    mySwitch.enableReceive(CC1101_GDO2);   // GDO2, nao GDO0!
     rcswitch_armed = true;
 
-    // Tambem armar ISR raw para captura de timings
-    isr_last_val = digitalRead(CC1101_GDO0);
+    // Tambem armar ISR raw no GDO2 para captura de timings
+    isr_last_val = digitalRead(CC1101_GDO2);   // GDO2
     isr_last_change = micros();
     isr_enabled = true;
-    attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
+    attachInterrupt(digitalPinToInterrupt(CC1101_GDO2), cc1101ISR, CHANGE);  // GDO2!
 }
 
 void cc1101CaptureLoop() {
@@ -344,7 +365,7 @@ void cc1101CaptureLoop() {
         }
     }
 
-    // Captura raw via ISR (fallback)
+    // Captura raw via ISR (fallback) - agora no GDO2
     if (capture_state == STATE_HOPPING) {
         if (isr_count > 5) {
             capture_state = STATE_LOCKED;
@@ -360,7 +381,7 @@ void cc1101CaptureLoop() {
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             cc1101GoRx(currentCapture.frequency);
-            isr_last_val = digitalRead(CC1101_GDO0);
+            isr_last_val = digitalRead(CC1101_GDO2);   // GDO2
             isr_last_change = micros();
             isr_enabled = true;
             lastFreqSwitch = nowMs;
@@ -368,7 +389,7 @@ void cc1101CaptureLoop() {
     }
     else if (capture_state == STATE_LOCKED) {
         isr_count = 0;
-        isr_last_val = digitalRead(CC1101_GDO0);
+        isr_last_val = digitalRead(CC1101_GDO2);   // GDO2
         isr_last_change = micros();
         capture_started = false;
         isr_enabled = true;
@@ -388,7 +409,7 @@ void cc1101CaptureLoop() {
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             cc1101GoRx(currentCapture.frequency);
-            isr_last_val = digitalRead(CC1101_GDO0);
+            isr_last_val = digitalRead(CC1101_GDO2);   // GDO2
             isr_last_change = micros();
             isr_enabled = true;
             lastFreqSwitch = nowMs;
@@ -396,7 +417,7 @@ void cc1101CaptureLoop() {
         else if ((capture_started && silenceTimeout) || bufferFull) {
             isr_enabled = false;
             cc1101CopyActive = false;
-            detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
+            detachInterrupt(digitalPinToInterrupt(CC1101_GDO2));   // GDO2
             if (rcswitch_armed) {
                 mySwitch.disableReceive();
                 rcswitch_armed = false;
@@ -441,7 +462,7 @@ void cc1101CaptureLoop() {
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             lastFreqSwitch = millis();
             cc1101GoRx(currentCapture.frequency);
-            isr_last_val = digitalRead(CC1101_GDO0);
+            isr_last_val = digitalRead(CC1101_GDO2);   // GDO2
             isr_last_change = micros();
             isr_enabled = true;
         }
@@ -451,7 +472,7 @@ void cc1101CaptureLoop() {
 void cc1101StopCapture() {
     isr_enabled = false;
     cc1101CopyActive = false;
-    detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
+    detachInterrupt(digitalPinToInterrupt(CC1101_GDO2));   // GDO2
     if (rcswitch_armed) {
         mySwitch.disableReceive();
         rcswitch_armed = false;
@@ -461,10 +482,10 @@ void cc1101StopCapture() {
 
 uint8_t cc1101GetPulseCount() { return isr_count; }
 uint32_t cc1101GetCurrentFreq() { return currentCapture.frequency / 1000000; }
-uint8_t cc1101GetPinState() { return digitalRead(CC1101_GDO0); }
+uint8_t cc1101GetPinState() { return digitalRead(CC1101_GDO2); }   // GDO2
 
 // ============================================================
-// Replay - transmite sinal gravado via GDO0
+// Replay - transmite sinal gravado via GDO0 (TX pin)
 // ============================================================
 void cc1101ReplaySignal(uint8_t index) {
     if (index >= savedSignalCount || !savedSignals[index].valid) return;
@@ -485,7 +506,7 @@ void cc1101ReplaySignal(uint8_t index) {
         delay(2);
 
         mySwitch.setProtocol(proto);
-        mySwitch.enableTransmit(CC1101_GDO0);
+        mySwitch.enableTransmit(CC1101_GDO0);   // GDO0 = TX pin (correto)
         mySwitch.send(value, bits);
         mySwitch.disableTransmit();
 
@@ -498,7 +519,7 @@ void cc1101ReplaySignal(uint8_t index) {
         ELECHOUSE_cc1101.SetTx();
         delay(2);
 
-        pinMode(CC1101_GDO0, OUTPUT);
+        pinMode(CC1101_GDO0, OUTPUT);   // GDO0 = TX
         digitalWrite(CC1101_GDO0, LOW);
         for (int i = 0; i < sig->length; i++) {
             digitalWrite(CC1101_GDO0, i % 2 == 0 ? HIGH : LOW);
@@ -521,7 +542,7 @@ void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
     ELECHOUSE_cc1101.SetTx();
     delay(2);
 
-    pinMode(CC1101_GDO0, OUTPUT);
+    pinMode(CC1101_GDO0, OUTPUT);   // GDO0 = TX
     digitalWrite(CC1101_GDO0, LOW);
     for (int rep = 0; rep < 3; rep++) {
         for (int i = 23; i >= 0; i--) {
@@ -560,7 +581,7 @@ void cc1101StartSubGHzJammer() {
     ELECHOUSE_cc1101.SetTx();
     delay(2);
 
-    pinMode(CC1101_GDO0, OUTPUT);
+    pinMode(CC1101_GDO0, OUTPUT);   // GDO0 = TX
     digitalWrite(CC1101_GDO0, HIGH);
     cc1101JammerActive = true;
 }
@@ -575,7 +596,7 @@ void cc1101StopSubGHzJammer() {
 }
 
 // ============================================================
-// RollJam
+// RollJam - RX agora no GDO2
 // ============================================================
 void cc1101StartRollJam() {
     if (!cc1101Initialized) return;
@@ -589,6 +610,7 @@ void cc1101StartRollJam() {
     ELECHOUSE_cc1101.setSidle();
     ELECHOUSE_cc1101.setMHZ(433.92);
     pinMode(CC1101_GDO0, INPUT);
+    pinMode(CC1101_GDO2, INPUT);   // GDO2 tambem INPUT
     ELECHOUSE_cc1101.SetRx();
     delay(5);
 }
@@ -599,13 +621,13 @@ void cc1101RollJamLoop() {
     unsigned long nowUs = micros();
 
     if (rj_state == 0) {
-        if (digitalRead(CC1101_GDO0) == HIGH) {
+        if (digitalRead(CC1101_GDO2) == HIGH) {   // GDO2, nao GDO0!
             isr_count = 0;
             isr_last_val = HIGH;
             isr_last_change = nowUs;
             capture_started = true;
             isr_enabled = true;
-            attachInterrupt(digitalPinToInterrupt(CC1101_GDO0), cc1101ISR, CHANGE);
+            attachInterrupt(digitalPinToInterrupt(CC1101_GDO2), cc1101ISR, CHANGE);  // GDO2
             rj_state = 1;
             rj_timer = now;
         }
@@ -613,10 +635,10 @@ void cc1101RollJamLoop() {
     else if (rj_state == 1) {
         if (now - rj_timer > 200) {
             isr_enabled = false;
-            detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
+            detachInterrupt(digitalPinToInterrupt(CC1101_GDO2));   // GDO2
             ELECHOUSE_cc1101.setSidle();
             ELECHOUSE_cc1101.SetTx();
-            pinMode(CC1101_GDO0, OUTPUT);
+            pinMode(CC1101_GDO0, OUTPUT);   // GDO0 = TX
             digitalWrite(CC1101_GDO0, HIGH);
             rj_state = 2;
             rj_timer = now;
@@ -646,8 +668,8 @@ void cc1101RollJamLoop() {
 void cc1101StopRollJam() {
     cc1101RollJamActive = false;
     isr_enabled = false;
-    detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
-    digitalWrite(CC1101_GDO0, LOW);
+    detachInterrupt(digitalPinToInterrupt(CC1101_GDO2));   // GDO2
+    digitalWrite(CC1101_GDO0, LOW);   // GDO0 = TX
     pinMode(CC1101_GDO0, INPUT);
     cc1101Sleep();
 }
@@ -733,7 +755,7 @@ void cc1101TransmitRaw(uint32_t frequency, uint16_t* timings, uint8_t length) {
     ELECHOUSE_cc1101.SetTx();
     delay(2);
 
-    pinMode(CC1101_GDO0, OUTPUT);
+    pinMode(CC1101_GDO0, OUTPUT);   // GDO0 = TX
     digitalWrite(CC1101_GDO0, LOW);
     for (int i = 0; i < length; i++) {
         digitalWrite(CC1101_GDO0, i % 2 == 0 ? HIGH : LOW);
