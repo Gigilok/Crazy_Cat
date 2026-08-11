@@ -99,21 +99,15 @@ void IRAM_ATTR cc1101ISR() {
 // ============================================================
 // reclaimSpiBus - baseado no reclaimSharedSpiBus() do ESP32-DIV
 // ------------------------------------------------------------
-// O SmartRC chama SPI.end() a cada operacao, o que destrói a
-// configuracao do barramento SPI. Quando o NRF24 (RF24 library)
-// tenta usar o barramento depois, ele falha porque SPI.begin()
-// nao foi chamado novamente.
+// O SmartRC chama SPI.end() a cada operacao (em SpiEnd()), o que
+// destrói a configuracao do barramento SPI para o NRF24.
 //
-// Esta funcao faz o que o DIV faz antes de cada operacao CC1101:
+// Esta funcao faz o que o DIV faz antes/depois de cada operacao
+// CC1101:
 //   1. Sobe TODOS os CS pins (NRF24, CC1101) para HIGH
 //   2. Chama SPI.end() para liberar o barramento
 //   3. Chama SPI.begin() com os pinos do CC1101 para reconfigurar
-//   4. Set frequency/mode/bitorder
-//
-// Isso garante que o barramento esteja sempre em estado conhecido
-// antes de qualquer operacao CC1101, e que o NRF24 possa retomar
-// o barramento depois (RF24 chama SPI.beginTransaction que funciona
-// sobre o SPI.begin que fizemos aqui).
+//   4. Seta frequency/mode/bitorder
 // ============================================================
 #include "driver/gpio.h"
 
@@ -126,19 +120,31 @@ static void reclaimSpiBus() {
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
 
-    // 2. Libera o barramento SPI completamente
+    // 2. Libera e reconfigura o barramento SPI
     SPI.end();
-
-    // 3. Reconfigura o barramento SPI com os pinos do CC1101
-    //    (mesmos pinos do NRF24 pois compartilham VSPI)
     SPI.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
-
-    // 4. Configura modo/frequencia
     SPI.setDataMode(SPI_MODE0);
     SPI.setBitOrder(MSBFIRST);
     SPI.setFrequency(4000000);
 
-    delay(2);
+    delay(1);
+}
+
+// restoreNrf24Spi - reconfigura o barramento SPI para o NRF24
+// DEVE ser chamada apos qualquer operacao CC1101 para que o NRF24
+// (RF24 library) possa usar o barramento novamente.
+static void restoreNrf24Spi() {
+    pinMode(CC1101_CSN, OUTPUT);
+    digitalWrite(CC1101_CSN, HIGH);
+    pinMode(NRF_CSN, OUTPUT);
+    digitalWrite(NRF_CSN, HIGH);
+    SPI.end();
+    // RF24 usa SPI.beginTransaction internamente, mas precisa do SPI.begin()
+    // com os pinos VSPI padrao para que os pinos estejam configurados
+    SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, -1);
+    SPI.setDataMode(SPI_MODE0);
+    SPI.setBitOrder(MSBFIRST);
+    SPI.setFrequency(8000000);
 }
 
 // Helper legacy (mantido para compatibilidade)
@@ -148,29 +154,36 @@ static void nrf24_release_bus() {
 
 // ============================================================
 // API publica - mantida para compatibilidade com o resto do projeto
+// Cada funcao faz reclaimSpiBus() antes e restoreNrf24Spi() depois
+// para nao quebrar o NRF24.
 // ============================================================
 void cc1101SetFrequency(uint32_t freqHz) {
     if (!cc1101Initialized) return;
-    nrf24_release_bus();
+    reclaimSpiBus();
     ELECHOUSE_cc1101.setMHZ(freqHz / 1000000.0);
+    restoreNrf24Spi();
 }
 
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
     if (!cc1101Initialized) return;
-    nrf24_release_bus();
+    reclaimSpiBus();
     ELECHOUSE_cc1101.SpiWriteReg(reg, value);
+    restoreNrf24Spi();
 }
 
 void cc1101SendCommand(uint8_t cmd) {
     if (!cc1101Initialized) return;
-    nrf24_release_bus();
+    reclaimSpiBus();
     ELECHOUSE_cc1101.SpiStrobe(cmd);
+    restoreNrf24Spi();
 }
 
 uint8_t cc1101ReadStatus(uint8_t reg) {
     if (!cc1101Initialized) return 0;
-    nrf24_release_bus();
-    return ELECHOUSE_cc1101.SpiReadStatus(reg);
+    reclaimSpiBus();
+    uint8_t v = ELECHOUSE_cc1101.SpiReadStatus(reg);
+    restoreNrf24Spi();
+    return v;
 }
 
 // ============================================================
@@ -229,6 +242,13 @@ bool cc1101Init() {
 
 // ============================================================
 // Sleep / Wake
+// ------------------------------------------------------------
+// IMPORTANTE: NAO usamos goSleep() (SPWD) porque o SmartRC nao
+// consegue acordar do SPWD de forma confiavel (o oscilador de
+// cristal precisa de ~150us para estabilizar e o Init() do
+// SmartRC nao espera isso). Em vez disso, usamos apenas setSidle()
+// (IDLE state), que preserva os registradores e eh mais facil
+// de acordar.
 // ============================================================
 void cc1101Sleep() {
     if (!cc1101Initialized) return;
@@ -238,49 +258,57 @@ void cc1101Sleep() {
         rcswitch_armed = false;
     }
     detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
-    nrf24_release_bus();
+    reclaimSpiBus();
     ELECHOUSE_cc1101.setSidle();
-    ELECHOUSE_cc1101.goSleep();
+    // NAO chamar goSleep() - causa problemas ao acordar
+    restoreNrf24Spi();
 }
 
 bool cc1101Wake() {
     if (!cc1101Initialized) return false;
-    nrf24_release_bus();
+    reclaimSpiBus();
 
-    // Init re-configura tudo (SmartRC cuida do reset automaticamente)
-    ELECHOUSE_cc1101.Init();
+    // Apenas setSidle() - se o chip estava em IDLE, continua em IDLE.
+    // Se estava em SLEEP (raro), o Init() abaixo cuida.
+    ELECHOUSE_cc1101.setSidle();
+    delay(2);
+
+    // Re-configura registradores (caso tenham sido perdidos)
     ELECHOUSE_cc1101.setCCMode(0);
     ELECHOUSE_cc1101.setModulation(2);
     ELECHOUSE_cc1101.setRxBW(500.0);
 
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
+    restoreNrf24Spi();
     return true;
 }
 
 // ============================================================
 // GoRx - entra em modo RX
 // ============================================================
+// IMPORTANTE: Esta funcao faz TODAS as operacoes CC1101 em sequencia
+// entre um unico par reclaimSpiBus()/restoreNrf24Spi(). Se chamarmos
+// restoreNrf24Spi() entre cada operacao, o SPI do CC1101 seria
+// destruido antes da proxima operacao e o SmartRC teria que fazer
+// SPI.begin() de novo (que eh lento e pode falhar).
 static bool cc1101GoRx(uint32_t freqHz) {
     if (!cc1101Initialized) return false;
-    nrf24_release_bus();
 
-    // Teste: ler PARTNUM antes de qualquer operacao para verificar se o SPI
-    // ainda esta funcionando. Se retornar 0x00, o CC1101 esta respondendo.
-    // Se retornar 0xFF, o barramento esta comprometido.
+    reclaimSpiBus();
+
+    // Ler PARTNUM para confirmar que o SPI esta funcionando
     uint8_t partnum_test = ELECHOUSE_cc1101.SpiReadStatus(0x30);  // PARTNUM
     Serial.print(F("[CC1101] GoRx pre-check: PARTNUM=0x"));
     Serial.print(partnum_test, HEX);
     Serial.flush();
 
     if (partnum_test != 0x00) {
-        Serial.println(F(" -> SPI comprometido! Re-inicializando..."));
-        // Re-inicializa completamente o CC1101
+        Serial.println(F(" -> SPI comprometido! Re-init..."));
         ELECHOUSE_cc1101.Init();
         ELECHOUSE_cc1101.setCCMode(0);
         ELECHOUSE_cc1101.setModulation(2);
         ELECHOUSE_cc1101.setRxBW(500.0);
-        nrf24_release_bus();
     } else {
         Serial.println(F(" -> SPI OK"));
     }
@@ -290,7 +318,7 @@ static bool cc1101GoRx(uint32_t freqHz) {
     ELECHOUSE_cc1101.SetRx();
     delay(10);
 
-    // Le MARCSTATE com retry (pode precisar de mais tempo apos SetRx)
+    // Le MARCSTATE com retry
     uint8_t marcstate = 0;
     for (int i = 0; i < 5; i++) {
         marcstate = ELECHOUSE_cc1101.SpiReadStatus(0x35) & 0x1F;  // MARCSTATE
@@ -315,6 +343,8 @@ static bool cc1101GoRx(uint32_t freqHz) {
     if (marcstate != 0x0D) {
         Serial.println(F("[CC1101] GoRx: AVISO - MARCSTATE != 0x0D"));
     }
+
+    restoreNrf24Spi();
     return marcstate == 0x0D;
 }
 
