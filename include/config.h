@@ -9,7 +9,7 @@
 #define OLED_SCK    22
 #define OLED_SDA    21
 
-#define BTN_UP      14
+#define BTN_UP      5
 #define BTN_DOWN    27
 #define BTN_SELECT  32
 #define BTN_BACK    33
@@ -21,12 +21,12 @@
 #define NRF_MISO    19
 
 // CC1101 agora no mesmo barramento VSPI do NRF24
-#define CC1101_GDO0 16
-#define CC1101_CSN  5
+#define CC1101_GDO0 12
+#define CC1101_CSN  14
 #define CC1101_SCK  18    // VSPI SCK
 #define CC1101_MOSI 23    // VSPI MOSI
 #define CC1101_MISO 19    // VSPI MISO
-#define CC1101_GDO2 17
+#define CC1101_GDO2 13
 
 #define BUZZER_PIN  4
 
