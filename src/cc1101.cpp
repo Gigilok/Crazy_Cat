@@ -227,13 +227,40 @@ static bool cc1101GoRx(uint32_t freqHz) {
     if (!cc1101Initialized) return false;
     nrf24_release_bus();
 
+    // Teste: ler PARTNUM antes de qualquer operacao para verificar se o SPI
+    // ainda esta funcionando. Se retornar 0x00, o CC1101 esta respondendo.
+    // Se retornar 0xFF, o barramento esta comprometido.
+    uint8_t partnum_test = ELECHOUSE_cc1101.SpiReadStatus(0x30);  // PARTNUM
+    Serial.print(F("[CC1101] GoRx pre-check: PARTNUM=0x"));
+    Serial.print(partnum_test, HEX);
+    Serial.flush();
+
+    if (partnum_test != 0x00) {
+        Serial.println(F(" -> SPI comprometido! Re-inicializando..."));
+        // Re-inicializa completamente o CC1101
+        ELECHOUSE_cc1101.Init();
+        ELECHOUSE_cc1101.setCCMode(0);
+        ELECHOUSE_cc1101.setModulation(2);
+        ELECHOUSE_cc1101.setRxBW(500.0);
+        nrf24_release_bus();
+    } else {
+        Serial.println(F(" -> SPI OK"));
+    }
+
     ELECHOUSE_cc1101.setSidle();
     ELECHOUSE_cc1101.setMHZ(freqHz / 1000000.0);
     ELECHOUSE_cc1101.SetRx();
-    delay(5);
+    delay(10);
 
-    uint8_t marcstate = ELECHOUSE_cc1101.SpiReadStatus(0x35) & 0x1F;  // CC1101_MARCSTATE
-    uint8_t rssiRaw = ELECHOUSE_cc1101.SpiReadStatus(0x34);            // CC1101_RSSI
+    // Le MARCSTATE com retry (pode precisar de mais tempo apos SetRx)
+    uint8_t marcstate = 0;
+    for (int i = 0; i < 5; i++) {
+        marcstate = ELECHOUSE_cc1101.SpiReadStatus(0x35) & 0x1F;  // MARCSTATE
+        if (marcstate == 0x0D) break;
+        delay(5);
+    }
+
+    uint8_t rssiRaw = ELECHOUSE_cc1101.SpiReadStatus(0x34);  // RSSI
     int rssiDbm = (rssiRaw >= 128) ? ((int)rssiRaw - 256) / 2 - 74 : (int)rssiRaw / 2 - 74;
 
     Serial.print(F("[CC1101] GoRx "));
