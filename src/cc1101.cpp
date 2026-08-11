@@ -1,28 +1,20 @@
 // ============================================================
 // CC1101 - Driver baseado em SmartRC-CC1101 (ELECHOUSE)
 // ------------------------------------------------------------
-// Reescrito para usar a biblioteca SmartRC-CC1101-Driver-Lib
-// (a mesma usada pelo ESP32-DIV) em vez de um driver proprietario.
-//
-// Vantagens:
-//   - Biblioteca testada por anos de uso
-//   - Gere SPI internamente (begin/end a cada acesso)
-//   - Sem conflito com NRF24 (cada acesso SPI e transacional)
-//   - Suporte nativo a captura via RCSwitch
-//
-// Pinagem (definida em config.h, compartilha VSPI com NRF24):
-//   CC1101_SCK  = 18 (VSPI SCK)
-//   CC1101_MISO = 19 (VSPI MISO)
-//   CC1101_MOSI = 23 (VSPI MOSI)
-//   CC1101_CSN  = 14
-//   CC1101_GDO0 = 17  (RX data / TX data)
-//   CC1101_GDO2 = 16  (status)
+// REESCRITO para replicar exatamente o padrao do ESP32-DIV:
+//   - reclaimSpiBus() UMA VEZ ao iniciar feature CC1101
+//   - restoreNrf24Spi() UMA VEZ ao sair do feature CC1101
+//   - Sem restoreNrf24Spi() entre operacoes individuais
+//   - Usa RCSwitch para recepcao (igual ao DIV)
+//   - Nao verifica MARCSTATE (o DIV nao verifica)
+//   - Nao chama goSleep()/SPWD (nenhum dos dois chama)
 // ============================================================
 
 #include <SPI.h>
 #include <ELECHOUSE_CC1101_SRC_DRV.h>
 #include <RCSwitch.h>
 #include "config.h"
+#include "driver/gpio.h"
 
 // ============================================================
 // Variaveis globais (interface publica mantida)
@@ -63,9 +55,8 @@ volatile unsigned long isr_last_change = 0;
 volatile uint8_t isr_last_val = 0;
 volatile bool capture_started = false;
 volatile bool isr_enabled = false;
-static bool isr_service_installed = false;
 
-// RCSwitch para decodificar sinais 433/315 MHz
+// RCSwitch para decodificar sinais (igual ao DIV)
 RCSwitch mySwitch = RCSwitch();
 static bool rcswitch_armed = false;
 
@@ -75,8 +66,11 @@ uint32_t spec_an_freqs[64];
 uint8_t spec_an_idx = 0;
 bool spec_an_running = false;
 
+// Flag: SPI esta configurado para CC1101?
+static bool spi_owned_by_cc1101 = false;
+
 // ============================================================
-// ISR (mantida para captura raw, quando nao usamos RCSwitch)
+// ISR para captura raw (fallback quando RCSwitch nao resolve)
 // ============================================================
 void IRAM_ATTR cc1101ISR() {
     if (!isr_enabled) return;
@@ -97,158 +91,126 @@ void IRAM_ATTR cc1101ISR() {
 }
 
 // ============================================================
-// reclaimSpiBus - baseado no reclaimSharedSpiBus() do ESP32-DIV
-// ------------------------------------------------------------
-// O SmartRC chama SPI.end() a cada operacao (em SpiEnd()), o que
-// destrói a configuracao do barramento SPI para o NRF24.
-//
-// Esta funcao faz o que o DIV faz antes/depois de cada operacao
-// CC1101:
-//   1. Sobe TODOS os CS pins (NRF24, CC1101) para HIGH
-//   2. Chama SPI.end() para liberar o barramento
-//   3. Chama SPI.begin() com os pinos do CC1101 para reconfigurar
-//   4. Seta frequency/mode/bitorder
+// reclaimSpiBus - baseado no reclaimSharedSpiBus() do DIV
+// Chamada UMA VEZ ao entrar no feature CC1101.
+// Sobe todos os CS, faz SPI.end() + SPI.begin() com pinos CC1101.
 // ============================================================
-#include "driver/gpio.h"
-
 static void reclaimSpiBus() {
-    // 1. Sobe todos os CS pins para HIGH (desseleciona todos os slaves)
     pinMode(NRF_CSN, OUTPUT);
     digitalWrite(NRF_CSN, HIGH);
     pinMode(NRF_CE, OUTPUT);
-    digitalWrite(NRF_CE, LOW);   // NRF24 em standby
+    digitalWrite(NRF_CE, LOW);
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
 
-    // 2. Libera e reconfigura o barramento SPI
     SPI.end();
     SPI.begin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
     SPI.setDataMode(SPI_MODE0);
     SPI.setBitOrder(MSBFIRST);
     SPI.setFrequency(4000000);
-
-    delay(1);
+    delay(2);
+    spi_owned_by_cc1101 = true;
 }
 
-// restoreNrf24Spi - reconfigura o barramento SPI para o NRF24
-// DEVE ser chamada apos qualquer operacao CC1101 para que o NRF24
-// (RF24 library) possa usar o barramento novamente.
+// restoreNrf24Spi - chamada UMA VEZ ao SAIR do feature CC1101
 static void restoreNrf24Spi() {
+    if (!spi_owned_by_cc1101) return;
     pinMode(CC1101_CSN, OUTPUT);
     digitalWrite(CC1101_CSN, HIGH);
     pinMode(NRF_CSN, OUTPUT);
     digitalWrite(NRF_CSN, HIGH);
     SPI.end();
-    // RF24 usa SPI.beginTransaction internamente, mas precisa do SPI.begin()
-    // com os pinos VSPI padrao para que os pinos estejam configurados
     SPI.begin(NRF_SCK, NRF_MISO, NRF_MOSI, -1);
     SPI.setDataMode(SPI_MODE0);
     SPI.setBitOrder(MSBFIRST);
     SPI.setFrequency(8000000);
+    spi_owned_by_cc1101 = false;
 }
 
-// Helper legacy (mantido para compatibilidade)
+// Helper legacy
 static void nrf24_release_bus() {
-    reclaimSpiBus();
+    if (!spi_owned_by_cc1101) reclaimSpiBus();
 }
 
 // ============================================================
-// API publica - mantida para compatibilidade com o resto do projeto
-// Cada funcao faz reclaimSpiBus() antes e restoreNrf24Spi() depois
-// para nao quebrar o NRF24.
+// API publica - mantida para compatibilidade
+// Estas funcoes sao chamadas por wifi_attacks.cpp (drone jammer)
+// e settings.cpp. Elas fazem reclaim/restore apenas se necessario.
 // ============================================================
 void cc1101SetFrequency(uint32_t freqHz) {
     if (!cc1101Initialized) return;
-    reclaimSpiBus();
+    nrf24_release_bus();
     ELECHOUSE_cc1101.setMHZ(freqHz / 1000000.0);
-    restoreNrf24Spi();
 }
 
 void cc1101WriteReg(uint8_t reg, uint8_t value) {
     if (!cc1101Initialized) return;
-    reclaimSpiBus();
+    nrf24_release_bus();
     ELECHOUSE_cc1101.SpiWriteReg(reg, value);
-    restoreNrf24Spi();
 }
 
 void cc1101SendCommand(uint8_t cmd) {
     if (!cc1101Initialized) return;
-    reclaimSpiBus();
+    nrf24_release_bus();
     ELECHOUSE_cc1101.SpiStrobe(cmd);
-    restoreNrf24Spi();
 }
 
 uint8_t cc1101ReadStatus(uint8_t reg) {
     if (!cc1101Initialized) return 0;
-    reclaimSpiBus();
-    uint8_t v = ELECHOUSE_cc1101.SpiReadStatus(reg);
-    restoreNrf24Spi();
-    return v;
+    nrf24_release_bus();
+    return ELECHOUSE_cc1101.SpiReadStatus(reg);
 }
 
 // ============================================================
-// Inicializacao
+// Inicializacao - replica exatamente o ReplayAttackSetup do DIV
 // ============================================================
 bool cc1101Init() {
     Serial.println(F("[CC1101] Inicializando com SmartRC..."));
     Serial.flush();
 
-    if (!isr_service_installed) {
-        esp_err_t err = gpio_install_isr_service(ESP_INTR_FLAG_LEVEL1);
-        if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
-            isr_service_installed = true;
-        }
-    }
-
-    // Configura pinos GDO (CSN/SCK/MOSI/MISO sao geridos pelo SmartRC)
+    // Configura pinos GDO
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
-    nrf24_release_bus();
-    delay(10);
 
-    // Configura pinos SPI do CC1101 no SmartRC
+    // Reclaim SPI UMA VEZ
+    reclaimSpiBus();
+
+    // Configura SmartRC (igual ao DIV)
     ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
     ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
 
-    // Init do chip (faz reset + RegConfigSettings internamente)
+    // Init + config (igual ao DIV)
     ELECHOUSE_cc1101.Init();
+    ELECHOUSE_cc1101.setCCMode(0);        // modo transparent
+    ELECHOUSE_cc1101.setModulation(2);    // ASK/OOK
+    ELECHOUSE_cc1101.setRxBW(500.0);      // 500 kHz
 
-    // Configura modo: ASK/OOK, sem packet mode (transparent async serial)
-    ELECHOUSE_cc1101.setCCMode(0);        // 0 = modo transparent (nao-packet)
-    ELECHOUSE_cc1101.setModulation(2);    // 2 = ASK/OOK (comum em controles)
-    ELECHOUSE_cc1101.setRxBW(500.0);      // 500 kHz RX bandwidth
-
-    // Le PARTNUM e VERSION para confirmar que o chip respondeu
-    uint8_t partnum = ELECHOUSE_cc1101.SpiReadStatus(0x30);  // CC1101_PARTNUM
-    uint8_t version = ELECHOUSE_cc1101.SpiReadStatus(0x31);  // CC1101_VERSION
+    // Verificacao (opcional - o DIV nao faz)
+    uint8_t partnum = ELECHOUSE_cc1101.SpiReadStatus(0x30);
+    uint8_t version = ELECHOUSE_cc1101.SpiReadStatus(0x31);
     Serial.print(F("[CC1101] PARTNUM=0x"));
     Serial.print(partnum, HEX);
     Serial.print(F(" VERSION=0x"));
     Serial.println(version, HEX);
-    Serial.flush();
 
-    // CC1101: PARTNUM=0x00, VERSION=0x04 (rev B) ou 0x14 (rev E)
     if (partnum != 0x00 || version == 0x00 || version == 0xFF) {
         Serial.println(F("[CC1101] FAIL: modulo nao responde"));
+        restoreNrf24Spi();
         return false;
     }
 
     cc1101Initialized = true;
     ELECHOUSE_cc1101.setSidle();
     Serial.println(F("[CC1101] OK - pronto para uso"));
-    Serial.flush();
+
+    // Restaurar SPI para NRF24 (init e uma feature unica)
+    restoreNrf24Spi();
     return true;
 }
 
 // ============================================================
 // Sleep / Wake
-// ------------------------------------------------------------
-// IMPORTANTE: NAO usamos goSleep() (SPWD) porque o SmartRC nao
-// consegue acordar do SPWD de forma confiavel (o oscilador de
-// cristal precisa de ~150us para estabilizar e o Init() do
-// SmartRC nao espera isso). Em vez disso, usamos apenas setSidle()
-// (IDLE state), que preserva os registradores e eh mais facil
-// de acordar.
+// NAO usamos goSleep()/SPWD. Apenas setSidle().
 // ============================================================
 void cc1101Sleep() {
     if (!cc1101Initialized) return;
@@ -258,9 +220,10 @@ void cc1101Sleep() {
         rcswitch_armed = false;
     }
     detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
-    reclaimSpiBus();
+    nrf24_release_bus();
     ELECHOUSE_cc1101.setSidle();
-    // NAO chamar goSleep() - causa problemas ao acordar
+    // NAO chamar goSleep()/SPWD
+    // Restaurar SPI para NRF24 ao sair do feature
     restoreNrf24Spi();
 }
 
@@ -268,91 +231,55 @@ bool cc1101Wake() {
     if (!cc1101Initialized) return false;
     reclaimSpiBus();
 
-    // Apenas setSidle() - se o chip estava em IDLE, continua em IDLE.
-    // Se estava em SLEEP (raro), o Init() abaixo cuida.
-    ELECHOUSE_cc1101.setSidle();
-    delay(2);
+    // Re-configurar SmartRC (caso pinos tenham mudado)
+    ELECHOUSE_cc1101.setSpiPin(CC1101_SCK, CC1101_MISO, CC1101_MOSI, CC1101_CSN);
+    ELECHOUSE_cc1101.setGDO(CC1101_GDO0, CC1101_GDO2);
 
-    // Re-configura registradores (caso tenham sido perdidos)
+    // Init + config (igual ao DIV)
+    ELECHOUSE_cc1101.Init();
     ELECHOUSE_cc1101.setCCMode(0);
     ELECHOUSE_cc1101.setModulation(2);
     ELECHOUSE_cc1101.setRxBW(500.0);
 
     pinMode(CC1101_GDO0, INPUT);
     pinMode(CC1101_GDO2, INPUT);
-    restoreNrf24Spi();
+
+    // NAO restaurar SPI aqui - quem chamou cc1101Wake vai usar CC1101
     return true;
 }
 
 // ============================================================
 // GoRx - entra em modo RX
+// Replica exatamente o tuneToIndex do DIV:
+//   setSidle() -> setMHZ() -> SetRx()
+// Sem pre-check, sem MARCSTATE, sem retry.
 // ============================================================
-// IMPORTANTE: Esta funcao faz TODAS as operacoes CC1101 em sequencia
-// entre um unico par reclaimSpiBus()/restoreNrf24Spi(). Se chamarmos
-// restoreNrf24Spi() entre cada operacao, o SPI do CC1101 seria
-// destruido antes da proxima operacao e o SmartRC teria que fazer
-// SPI.begin() de novo (que eh lento e pode falhar).
 static bool cc1101GoRx(uint32_t freqHz) {
     if (!cc1101Initialized) return false;
-
-    reclaimSpiBus();
-
-    // Ler PARTNUM para confirmar que o SPI esta funcionando
-    uint8_t partnum_test = ELECHOUSE_cc1101.SpiReadStatus(0x30);  // PARTNUM
-    Serial.print(F("[CC1101] GoRx pre-check: PARTNUM=0x"));
-    Serial.print(partnum_test, HEX);
-    Serial.flush();
-
-    if (partnum_test != 0x00) {
-        Serial.println(F(" -> SPI comprometido! Re-init..."));
-        ELECHOUSE_cc1101.Init();
-        ELECHOUSE_cc1101.setCCMode(0);
-        ELECHOUSE_cc1101.setModulation(2);
-        ELECHOUSE_cc1101.setRxBW(500.0);
-    } else {
-        Serial.println(F(" -> SPI OK"));
-    }
+    // SPI ja foi reclaimed por cc1101Wake() - nao fazer nada aqui
 
     ELECHOUSE_cc1101.setSidle();
     ELECHOUSE_cc1101.setMHZ(freqHz / 1000000.0);
     ELECHOUSE_cc1101.SetRx();
-    delay(10);
+    delay(5);
 
-    // Le MARCSTATE com retry
-    uint8_t marcstate = 0;
-    for (int i = 0; i < 5; i++) {
-        marcstate = ELECHOUSE_cc1101.SpiReadStatus(0x35) & 0x1F;  // MARCSTATE
-        if (marcstate == 0x0D) break;
-        delay(5);
-    }
-
-    uint8_t rssiRaw = ELECHOUSE_cc1101.SpiReadStatus(0x34);  // RSSI
-    int rssiDbm = (rssiRaw >= 128) ? ((int)rssiRaw - 256) / 2 - 74 : (int)rssiRaw / 2 - 74;
-
+    // Log simples (nao bloqueia)
+    uint8_t marcstate = ELECHOUSE_cc1101.SpiReadStatus(0x35) & 0x1F;
+    int rssi = ELECHOUSE_cc1101.getRssi();
     Serial.print(F("[CC1101] GoRx "));
     Serial.print(freqHz);
-    Serial.print(F(" Hz | MARCSTATE=0x"));
+    Serial.print(F(" Hz | MARC=0x"));
     Serial.print(marcstate, HEX);
     Serial.print(F(" RSSI="));
-    Serial.print(rssiDbm);
+    Serial.print(rssi);
     Serial.print(F(" GDO0="));
-    Serial.print(digitalRead(CC1101_GDO0));
-    Serial.print(F(" GDO2="));
-    Serial.println(digitalRead(CC1101_GDO2));
+    Serial.println(digitalRead(CC1101_GDO0));
 
-    if (marcstate != 0x0D) {
-        Serial.println(F("[CC1101] GoRx: AVISO - MARCSTATE != 0x0D"));
-    }
-
-    restoreNrf24Spi();
-    return marcstate == 0x0D;
+    return true;
 }
 
 // ============================================================
-// Captura RAW via ISR (mantida para compatibilidade)
-// Usamos ISR direta no GDO0 para capturar timings como o codigo
-// original. Funciona porque o SmartRC configurou IOCFG0=0x0D
-// (que em modo setCCMode(0) coloca GDO0 como async serial output).
+// Captura RAW via RCSwitch (igual ao DIV)
 // ============================================================
 void cc1101StartCapture() {
     if (!cc1101Initialized) return;
@@ -366,12 +293,17 @@ void cc1101StartCapture() {
     currentCapture.frequency = captureFreqs[currentFreqIndex];
     lastFreqSwitch = millis();
     capture_state = STATE_HOPPING;
-    isr_enabled = false;
     isr_count = 0;
     capture_started = false;
 
     cc1101GoRx(currentCapture.frequency);
 
+    // Armar RCSwitch no GDO0 (igual ao DIV arma no GDO2)
+    pinMode(CC1101_GDO0, INPUT);
+    mySwitch.enableReceive(CC1101_GDO0);
+    rcswitch_armed = true;
+
+    // Tambem armar ISR raw para captura de timings
     isr_last_val = digitalRead(CC1101_GDO0);
     isr_last_change = micros();
     isr_enabled = true;
@@ -383,6 +315,36 @@ void cc1101CaptureLoop() {
     unsigned long now = micros();
     unsigned long nowMs = millis();
 
+    // Verificar se RCSwitch decodificou algo
+    if (rcswitch_armed && mySwitch.available()) {
+        uint32_t value = mySwitch.getReceivedValue();
+        uint16_t bits = mySwitch.getReceivedBitlength();
+        uint16_t proto = mySwitch.getReceivedProtocol();
+        mySwitch.resetAvailable();
+
+        if (value > 0 && savedSignalCount < MAX_SAVED_SIGNALS) {
+            SignalData* sig = &savedSignals[savedSignalCount];
+            sig->length = 1;  // RCSwitch decodifica, nao precisa de timings
+            sig->frequency = currentCapture.frequency;
+            sig->modulation = 0;
+            sig->valid = true;
+            // Guardar value e bits nos primeiros timings para compatibilidade
+            sig->timings[0] = (uint16_t)(value & 0xFFFF);
+            sig->timings[1] = (uint16_t)(value >> 16);
+            sig->timings[2] = bits;
+            sig->timings[3] = proto;
+            snprintf(sig->name, 16, "Cod %luM", sig->frequency / 1000000);
+            savedSignalCount++;
+            Serial.print(F("[CC1101] RCSwitch: val="));
+            Serial.print(value);
+            Serial.print(F(" bits="));
+            Serial.print(bits);
+            Serial.print(F(" proto="));
+            Serial.println(proto);
+        }
+    }
+
+    // Captura raw via ISR (fallback)
     if (capture_state == STATE_HOPPING) {
         if (isr_count > 5) {
             capture_state = STATE_LOCKED;
@@ -392,9 +354,6 @@ void cc1101CaptureLoop() {
             Serial.println(isr_count);
         }
         else if (nowMs - lastFreqSwitch > 1000) {
-            if (isr_count == 0 && !capture_started) {
-                // Sem sinal nesta frequencia, hop para a proxima
-            }
             isr_enabled = false;
             isr_count = 0;
             capture_started = false;
@@ -426,7 +385,6 @@ void cc1101CaptureLoop() {
             isr_count = 0;
             capture_started = false;
             capture_state = STATE_HOPPING;
-            isr_last_change = micros();
             currentFreqIndex = (currentFreqIndex + 1) % 4;
             currentCapture.frequency = captureFreqs[currentFreqIndex];
             cc1101GoRx(currentCapture.frequency);
@@ -437,9 +395,12 @@ void cc1101CaptureLoop() {
         }
         else if ((capture_started && silenceTimeout) || bufferFull) {
             isr_enabled = false;
-            currentCapture.active = false;
             cc1101CopyActive = false;
             detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
+            if (rcswitch_armed) {
+                mySwitch.disableReceive();
+                rcswitch_armed = false;
+            }
             ELECHOUSE_cc1101.setSidle();
             if (isr_count > 20 && savedSignalCount < MAX_SAVED_SIGNALS) {
                 SignalData* sig = &savedSignals[savedSignalCount];
@@ -466,13 +427,11 @@ void cc1101CaptureLoop() {
                 Serial.print(F(" pulsos, "));
                 Serial.print(totalDuration);
                 Serial.println(F(" us"));
-            } else {
-                Serial.println(F("[CC1101] Sem sinal valido"));
             }
+            cc1101Sleep();
         }
         else if (totalTimeout) {
             isr_enabled = false;
-            currentCapture.count = 0;
             currentCapture.startTime = millis();
             captureStartTime = millis();
             isr_count = 0;
@@ -492,9 +451,12 @@ void cc1101CaptureLoop() {
 void cc1101StopCapture() {
     isr_enabled = false;
     cc1101CopyActive = false;
-    currentCapture.active = false;
     detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
-    if (cc1101Initialized) ELECHOUSE_cc1101.setSidle();
+    if (rcswitch_armed) {
+        mySwitch.disableReceive();
+        rcswitch_armed = false;
+    }
+    cc1101Sleep();
 }
 
 uint8_t cc1101GetPulseCount() { return isr_count; }
@@ -502,43 +464,56 @@ uint32_t cc1101GetCurrentFreq() { return currentCapture.frequency / 1000000; }
 uint8_t cc1101GetPinState() { return digitalRead(CC1101_GDO0); }
 
 // ============================================================
-// Replay - transmite sinal gravado via GDO0 (asynchronous TX)
+// Replay - transmite sinal gravado via GDO0
 // ============================================================
 void cc1101ReplaySignal(uint8_t index) {
     if (index >= savedSignalCount || !savedSignals[index].valid) return;
     if (!cc1101Initialized) return;
     if (!cc1101Wake()) return;
-    isr_enabled = false;
 
     SignalData* sig = &savedSignals[index];
-    nrf24_release_bus();
 
-    ELECHOUSE_cc1101.setSidle();
-    ELECHOUSE_cc1101.setMHZ(sig->frequency / 1000000.0);
+    // Se foi capturado via RCSwitch (timings[2] = bits), usar RCSwitch.send()
+    if (sig->length == 1 && sig->timings[2] > 0) {
+        uint32_t value = (uint32_t)sig->timings[1] << 16 | sig->timings[0];
+        uint16_t bits = sig->timings[2];
+        uint16_t proto = sig->timings[3];
 
-    // Configura GDO0 para TX asincrona (0x2E = TX async serial data input)
-    ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x2E);  // CC1101_IOCFG0
-    ELECHOUSE_cc1101.SetTx();
-    delay(2);
+        ELECHOUSE_cc1101.setSidle();
+        ELECHOUSE_cc1101.setMHZ(sig->frequency / 1000000.0);
+        ELECHOUSE_cc1101.SetTx();
+        delay(2);
 
-    pinMode(CC1101_GDO0, OUTPUT);
-    digitalWrite(CC1101_GDO0, LOW);
-    for (int i = 0; i < sig->length; i++) {
-        digitalWrite(CC1101_GDO0, i % 2 == 0 ? HIGH : LOW);
-        delayMicroseconds(sig->timings[i]);
+        mySwitch.setProtocol(proto);
+        mySwitch.enableTransmit(CC1101_GDO0);
+        mySwitch.send(value, bits);
+        mySwitch.disableTransmit();
+
+        ELECHOUSE_cc1101.setSidle();
+    } else {
+        // Captura raw via ISR - transmitir timings manualmente
+        ELECHOUSE_cc1101.setSidle();
+        ELECHOUSE_cc1101.setMHZ(sig->frequency / 1000000.0);
+        ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x2E);  // IOCFG0 = TX async
+        ELECHOUSE_cc1101.SetTx();
+        delay(2);
+
+        pinMode(CC1101_GDO0, OUTPUT);
+        digitalWrite(CC1101_GDO0, LOW);
+        for (int i = 0; i < sig->length; i++) {
+            digitalWrite(CC1101_GDO0, i % 2 == 0 ? HIGH : LOW);
+            delayMicroseconds(sig->timings[i]);
+        }
+        digitalWrite(CC1101_GDO0, LOW);
+        pinMode(CC1101_GDO0, INPUT_PULLUP);
+        ELECHOUSE_cc1101.setSidle();
     }
-    digitalWrite(CC1101_GDO0, LOW);
-    pinMode(CC1101_GDO0, INPUT_PULLUP);
-
-    ELECHOUSE_cc1101.setSidle();
     cc1101Sleep();
 }
 
 void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
     if (!cc1101Initialized) return;
     if (!cc1101Wake()) return;
-    isr_enabled = false;
-    nrf24_release_bus();
 
     ELECHOUSE_cc1101.setSidle();
     ELECHOUSE_cc1101.setMHZ(freq / 1000000.0);
@@ -578,12 +553,10 @@ void cc1101SendBruteForceCode(uint32_t code, uint32_t freq) {
 void cc1101StartSubGHzJammer() {
     if (!cc1101Initialized) return;
     if (!cc1101Wake()) return;
-    isr_enabled = false;
-    nrf24_release_bus();
 
     ELECHOUSE_cc1101.setSidle();
     ELECHOUSE_cc1101.setMHZ(433.92);
-    ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x2E);  // IOCFG0 = TX async
+    ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x2E);
     ELECHOUSE_cc1101.SetTx();
     delay(2);
 
@@ -612,11 +585,9 @@ void cc1101StartRollJam() {
     rj_timer = millis();
     currentCapture.frequency = 433920000;
     isr_enabled = false;
-    nrf24_release_bus();
 
     ELECHOUSE_cc1101.setSidle();
     ELECHOUSE_cc1101.setMHZ(433.92);
-    ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x2E);  // IOCFG0 = async serial
     pinMode(CC1101_GDO0, INPUT);
     ELECHOUSE_cc1101.SetRx();
     delay(5);
@@ -643,9 +614,7 @@ void cc1101RollJamLoop() {
         if (now - rj_timer > 200) {
             isr_enabled = false;
             detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
-            nrf24_release_bus();
             ELECHOUSE_cc1101.setSidle();
-            ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x2E);
             ELECHOUSE_cc1101.SetTx();
             pinMode(CC1101_GDO0, OUTPUT);
             digitalWrite(CC1101_GDO0, HIGH);
@@ -680,10 +649,7 @@ void cc1101StopRollJam() {
     detachInterrupt(digitalPinToInterrupt(CC1101_GDO0));
     digitalWrite(CC1101_GDO0, LOW);
     pinMode(CC1101_GDO0, INPUT);
-    if (cc1101Initialized) {
-        ELECHOUSE_cc1101.setSidle();
-        cc1101Sleep();
-    }
+    cc1101Sleep();
 }
 
 // ============================================================
@@ -698,7 +664,6 @@ void cc1101StartAnalyzer() {
     for(int i=0; i<16; i++) spec_an_freqs[15+i] = 387000000 + (i * 4800000);
     for(int i=0; i<33; i++) spec_an_freqs[31+i] = 779000000 + (i * 4500000);
     for(int i=0; i<64; i++) spec_an_values[i] = 0;
-    nrf24_release_bus();
     ELECHOUSE_cc1101.setMHZ(spec_an_freqs[0] / 1000000.0);
     ELECHOUSE_cc1101.SetRx();
 }
@@ -708,14 +673,12 @@ void cc1101AnalyzerLoop() {
     for(int i=0; i<64; i++) {
         if (spec_an_values[i] > 0) spec_an_values[i]--;
     }
-    nrf24_release_bus();
     uint32_t freq = spec_an_freqs[spec_an_idx];
     ELECHOUSE_cc1101.setSidle();
     ELECHOUSE_cc1101.setMHZ(freq / 1000000.0);
     ELECHOUSE_cc1101.SetRx();
     delayMicroseconds(300);
-    uint8_t rssiDec = ELECHOUSE_cc1101.getRssi();
-    int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
+    int rssi = ELECHOUSE_cc1101.getRssi();
     if (rssi < -90) rssi = -90;
     if (rssi > -50) rssi = -50;
     uint16_t target_h = map(rssi, -90, -50, 0, 40);
@@ -726,10 +689,7 @@ void cc1101AnalyzerLoop() {
 
 void cc1101StopAnalyzer() {
     spec_an_running = false;
-    if (cc1101Initialized) {
-        ELECHOUSE_cc1101.setSidle();
-        cc1101Sleep();
-    }
+    cc1101Sleep();
 }
 
 bool cc1101AnalyzerIsRunning() { return spec_an_running; }
@@ -766,12 +726,10 @@ void cc1101DeleteSignal(uint8_t index) {
 void cc1101TransmitRaw(uint32_t frequency, uint16_t* timings, uint8_t length) {
     if (!cc1101Initialized || length == 0 || length > 200) return;
     if (!cc1101Wake()) return;
-    isr_enabled = false;
-    nrf24_release_bus();
 
     ELECHOUSE_cc1101.setSidle();
     ELECHOUSE_cc1101.setMHZ(frequency / 1000000.0);
-    ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x2E);  // IOCFG0 = TX async
+    ELECHOUSE_cc1101.SpiWriteReg(0x02, 0x2E);
     ELECHOUSE_cc1101.SetTx();
     delay(2);
 
@@ -804,7 +762,6 @@ SignalData* cc1101GetSignal(uint8_t index) {
 int8_t cc1101GetDroneRSSI() {
     if (!cc1101Initialized) return 0;
     if (!cc1101Wake()) return 0;
-    nrf24_release_bus();
     int maxRssiDbm = -100;
     int persistentHits = 0;
     for(int freq=0; freq<2; freq++) {
@@ -814,8 +771,7 @@ int8_t cc1101GetDroneRSSI() {
         ELECHOUSE_cc1101.SetRx();
         delayMicroseconds(500);
         for(int i=0; i<3; i++) {
-            uint8_t rssiDec = ELECHOUSE_cc1101.getRssi();
-            int rssi = (rssiDec >= 128) ? ((int)rssiDec - 256) / 2 - 74 : (int)rssiDec / 2 - 74;
+            int rssi = ELECHOUSE_cc1101.getRssi();
             if (rssi > maxRssiDbm) maxRssiDbm = rssi;
             if (rssi > -75) persistentHits++;
             delay(5);
