@@ -21,12 +21,12 @@
 #define NRF_MISO    19
 
 // CC1101 agora no mesmo barramento VSPI do NRF24
-#define CC1101_GDO0 12
+#define CC1101_GDO0 17
 #define CC1101_CSN  14
 #define CC1101_SCK  18    // VSPI SCK
 #define CC1101_MOSI 23    // VSPI MOSI
 #define CC1101_MISO 19    // VSPI MISO
-#define CC1101_GDO2 13
+#define CC1101_GDO2 16
 
 #define BUZZER_PIN  4
 
